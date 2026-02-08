@@ -1,0 +1,20 @@
+type: segearthov3
+name: segearthov3-sam3
+display_name: "SegEarth-OV-3 (SAM3)"
+model_path: /home/yeon030108/capstone/SegEarth-OV-3/weights/sam3/sam3.pt
+segearthov3_path: /home/yeon030108/capstone/SegEarth-OV-3
+classes:
+  - background
+  - "bareland,barren"
+  - grass
+  - road
+  - "tree,forest"
+  - "water,river"
+  - cropland
+  - "building,roof,house"
+prob_thd: 0.1
+confidence_threshold: 0.1
+slide_stride: 512
+slide_crop: 512
+bg_idx: 0
+epsilon_factor: 0.001

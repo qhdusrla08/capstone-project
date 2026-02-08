@@ -1,0 +1,37 @@
+# Large files
+Miniconda3-latest-Linux-x86_64.sh
+*.pt
+*.pth
+*.ckpt
+*.bin
+
+# Junk files from pip install
+=*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Environment
+.env
+.venv/
+env/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

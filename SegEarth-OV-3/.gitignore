@@ -1,0 +1,12 @@
+__pycache__
+.vscode/
+.idea/
+data
+pretrained
+results.xlsx
+work_dirs
+example
+run.sh
+show_dir
+weights
+figs
