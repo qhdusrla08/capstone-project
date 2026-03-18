@@ -12,9 +12,24 @@ classes:
   - "water,river"
   - cropland
   - "building,roof,house"
+# - "car, vehicle, truck"
+  - parking lot
+
 prob_thd: 0.1
 confidence_threshold: 0.1
 slide_stride: 512
 slide_crop: 512
 bg_idx: 0
 epsilon_factor: 0.001
+
+# --- Category-Adaptive Dual-Head Fusion 설정 ---
+fusion_mode: "heuristic"   # "max" | "heuristic" | "entropy"
+things_alpha: 0.8          # things 카테고리: instance head 가중치
+stuff_alpha: 0.2           # stuff 카테고리: semantic head 가중치
+things_categories:
+  - building
+ # - car
+ # - car
+ # - ship
+ # - airplane
+ # - vehicle

@@ -53,7 +53,7 @@ class SegEarthOV3(Model):
         model_path = self.config.get("model_path", "")
         self.classes = self.config.get(
             "classes",
-            ["background", "bareland", "grass", "road", "tree", "water", "cropland", "building"],
+            ["background", "bareland", "grass", "road", "tree", "water", "cropland", "building", "car"],
         )
         self.prob_thd = self.config.get("prob_thd", 0.1)
         self.confidence_threshold = self.config.get("confidence_threshold", 0.1)
@@ -61,6 +61,18 @@ class SegEarthOV3(Model):
         self.slide_crop = self.config.get("slide_crop", 512)
         self.bg_idx = self.config.get("bg_idx", 0)
         self.epsilon_factor = self.config.get("epsilon_factor", 0.001)
+
+        # [ADDED] Category-Adaptive Dual-Head Fusion 파라미터 (Novelty Idea 1)
+        # fusion_mode에 따라 두 헤드 결합 전략(max / heuristic / entropy)을 선택하고,
+        # things/stuff 카테고리별로 서로 다른 α 가중치를 적용한다.
+        self.fusion_mode  = self.config.get("fusion_mode", "max")
+        self.things_alpha = self.config.get("things_alpha", 0.8)
+        self.stuff_alpha  = self.config.get("stuff_alpha", 0.2)
+        things_categories = self.config.get(
+            "things_categories",
+            ["building", "car"],
+        )
+        self.things_set = set(c.lower() for c in things_categories)
 
         # Validate paths
         if not os.path.isdir(segearthov3_path):
@@ -103,6 +115,7 @@ class SegEarthOV3(Model):
 
         # Parse class names (support comma-separated synonyms)
         self._parse_classes()
+        self._build_alpha_vector()  # [ADDED] 카테고리별 α 벡터 사전 계산 (heuristic 모드용)
 
         on_message(
             self.tr("SegEarth-OV-3 model loaded successfully.")
@@ -123,6 +136,57 @@ class SegEarthOV3(Model):
             self.query_idx, dtype=torch.int64, device=self.device
         )
 
+    # [NEW METHOD] heuristic 융합 모드에서 사용할 카테고리별 고정 α 가중치 벡터를
+    # query_word 단위로 미리 계산해 GPU 텐서로 저장한다.
+    # things 카테고리(건물·차량 등 개체)는 things_alpha, 나머지 stuff는 stuff_alpha 적용.
+    def _build_alpha_vector(self):
+        """카테고리별 α_c 벡터를 미리 계산한다. (query_word 단위)"""
+        alphas = []
+        for idx, word in enumerate(self.query_words):
+            cls_idx  = self.query_idx[idx]
+            cls_name = self.classes[cls_idx].split(",")[0].strip().lower()
+            if cls_name in self.things_set:
+                alphas.append(self.things_alpha)
+            else:
+                alphas.append(self.stuff_alpha)
+        # shape: (num_queries,) — GPU에 올려두어 루프 내 인덱싱 가능
+        self.alpha_vec = torch.tensor(
+            alphas, dtype=torch.float32, device=self.device
+        )
+
+    # [NEW METHOD] entropy 융합 모드에서 사용할 동적 α 계산 메서드.
+    # 두 헤드의 예측 엔트로피를 비교해 α를 런타임에 결정한다.
+    # semantic 헤드가 불확실할수록(H_sem↑) α↓ → instance 헤드에 더 많은 가중치 부여.
+    @staticmethod
+    def _compute_entropy_alpha(
+        inst_logits: torch.Tensor,
+        sem_logits: torch.Tensor,
+        eps: float = 1e-8,
+    ) -> float:
+        """
+        두 헤드의 예측 엔트로피로 α를 동적 계산한다.
+
+        Args:
+            inst_logits: P_inst_agg  (H, W) — sigmoid 이전 logit
+            sem_logits:  P_sem       (H, W) — sigmoid 이전 logit
+        Returns:
+            alpha: float in [0, 1]
+                   높을수록 instance head에 더 많은 가중치
+        """
+        def _entropy(logits: torch.Tensor) -> float:
+            p   = torch.sigmoid(logits.float())          # bfloat16 대비 float32
+            p   = p.clamp(eps, 1.0 - eps)
+            ent = -(p * torch.log(p) + (1 - p) * torch.log(1 - p))
+            return ent.mean().item()
+
+        h_inst = _entropy(inst_logits)
+        h_sem  = _entropy(sem_logits)
+        denom  = h_inst + h_sem
+
+        if denom < eps:
+            return 0.5   # 두 헤드 모두 완전 확실 → 동등 가중치
+        return h_sem / denom   # H_sem 클수록 α↓ (semantic 불확실 → instance 선호)
+
     def _inference_single_view(self, image):
         """Run inference on a single PIL image."""
         w, h = image.size
@@ -141,7 +205,12 @@ class SegEarthOV3(Model):
                     state=inference_state, prompt=query_word
                 )
 
-                # Instance head
+
+                # Novelty Idea 1: Category-Adaptive Dual-Head Fusion
+
+                # ── [HEAD 1] Instance Head ─────────────────────────────────────
+                # N개의 instance mask logit을 object_score와 곱한 뒤 element-wise MAX로 집계
+                # 결과: P_inst_agg (shape: H×W)
                 if inference_state["masks_logits"].shape[0] > 0:
                     inst_len = inference_state["masks_logits"].shape[0]
                     for inst_id in range(inst_len):
@@ -151,6 +220,7 @@ class SegEarthOV3(Model):
                         instance_score = inference_state["object_score"][
                             inst_id
                         ]
+                        # (resize if needed)
                         if instance_logits.shape != (h, w):
                             instance_logits = F.interpolate(
                                 instance_logits.view(
@@ -162,10 +232,14 @@ class SegEarthOV3(Model):
                             ).squeeze()
                         seg_logits[query_idx] = torch.max(
                             seg_logits[query_idx],
-                            instance_logits * instance_score,
+                            instance_logits * instance_score,       # P_inst_i × score_i
                         )
 
-                # Semantic head
+
+                # ── [HEAD 2] Semantic Head ─────────────────────────────────────
+                # → seg_logits[query_idx] = P_inst_agg = MAX_i(P_inst_i × score_i)
+                # 전역 semantic mask logit을 instance 집계 결과와 element-wise MAX로 융합
+                # 결과: P_fused = max(P_inst_agg, P_sem)  ← 논문 Eq. 2
                 semantic_logits = inference_state["semantic_mask_logits"]
                 if semantic_logits.shape != (h, w):
                     semantic_logits = F.interpolate(
@@ -176,14 +250,42 @@ class SegEarthOV3(Model):
                         mode="bilinear",
                         align_corners=False,
                     ).squeeze()
-                seg_logits[query_idx] = torch.max(
-                    seg_logits[query_idx], semantic_logits
-                )
 
-                # Presence score
+                # ── Dual-Head Fusion ─────────────────────────────────────────────
+                # [CHANGED] 기존 단순 max 고정 융합 → fusion_mode에 따라 세 가지 전략 분기:
+                #   max      : element-wise max (원래 방식 유지)
+                #   heuristic: 카테고리별 고정 α로 가중 평균 (things vs stuff 차등)
+                #   entropy  : 두 헤드의 예측 엔트로피로 α를 런타임에 동적 결정
+                inst_logits = seg_logits[query_idx].clone()   # P_inst_agg
+
+                if self.fusion_mode == "max":
+                    seg_logits[query_idx] = torch.max(
+                        inst_logits, semantic_logits
+                    )
+
+                elif self.fusion_mode == "heuristic":
+                    alpha = self.alpha_vec[query_idx]
+                    seg_logits[query_idx] = (
+                        alpha * inst_logits.float()
+                        + (1.0 - alpha) * semantic_logits.float()
+                    )
+
+                elif self.fusion_mode == "entropy":
+                    alpha = self._compute_entropy_alpha(
+                        inst_logits, semantic_logits
+                    )
+                    seg_logits[query_idx] = (
+                        alpha * inst_logits.float()
+                        + (1.0 - alpha) * semantic_logits.float()
+                    )
+
+
+                # ── [Presence Score] ──────────────────────────────────────────
+                # 클래스 존재 확률로 스케일링 → false positive 억제
                 seg_logits[query_idx] = (
                     seg_logits[query_idx] * inference_state["presence_score"]
                 )
+
 
         return seg_logits
 
@@ -331,6 +433,10 @@ class SegEarthOV3(Model):
                 shapes.append(shape)
 
         return shapes
+
+    def set_auto_labeling_preserve_existing_annotations_state(self, state):
+        """Toggle the preservation of existing annotations based on the checkbox state."""
+        self.replace = not state
 
     def set_auto_labeling_conf(self, value):
         """Update probability threshold from UI slider."""

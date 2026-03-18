@@ -35,3 +35,10 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Personal notes
+drafts/
+SegEarth-OV-3/docs/experiment_direction.md
+
+# Experiment Visualization (.png)
+SegEarth-OV-3/dual_head_fusion_visualization
