@@ -154,38 +154,40 @@ class SegEarthOV3(Model):
             alphas, dtype=torch.float32, device=self.device
         )
 
-    # [NEW METHOD] entropy 융합 모드에서 사용할 동적 α 계산 메서드.
-    # 두 헤드의 예측 엔트로피를 비교해 α를 런타임에 결정한다.
-    # semantic 헤드가 불확실할수록(H_sem↑) α↓ → instance 헤드에 더 많은 가중치 부여.
+    # [NEW METHOD] entropy 융합 모드에서 사용할 픽셀별 동적 α 계산 메서드.
+    # 두 헤드의 픽셀별 예측 엔트로피를 비교해 α_map (H×W)을 런타임에 결정한다.
+    # instance 헤드가 확실할수록(H_inst↓, confidence↑) α↑ → instance 헤드에 더 많은 가중치 부여.
     @staticmethod
     def _compute_entropy_alpha(
         inst_logits: torch.Tensor,
         sem_logits: torch.Tensor,
-        eps: float = 1e-8,
-    ) -> float:
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
         """
-        두 헤드의 예측 엔트로피로 α를 동적 계산한다.
+        두 헤드의 픽셀별 예측 엔트로피로 α_map (H×W)을 동적 계산한다.
 
         Args:
             inst_logits: P_inst_agg  (H, W) — sigmoid 이전 logit
             sem_logits:  P_sem       (H, W) — sigmoid 이전 logit
         Returns:
-            alpha: float in [0, 1]
-                   높을수록 instance head에 더 많은 가중치
+            alpha_map: Tensor (H, W), values in [0, 1]
+                       높을수록 instance head에 더 많은 가중치
         """
-        def _entropy(logits: torch.Tensor) -> float:
-            p   = torch.sigmoid(logits.float())          # bfloat16 대비 float32
-            p   = p.clamp(eps, 1.0 - eps)
-            ent = -(p * torch.log(p) + (1 - p) * torch.log(1 - p))
-            return ent.mean().item()
+        import math
 
-        h_inst = _entropy(inst_logits)
-        h_sem  = _entropy(sem_logits)
-        denom  = h_inst + h_sem
+        def _binary_entropy(logits: torch.Tensor) -> torch.Tensor:
+            p = torch.sigmoid(logits.float())            # bfloat16 대비 float32
+            p = p.clamp(eps, 1.0 - eps)
+            # log2 정규화 → 엔트로피 범위 [0, 1]
+            return -(p * p.log() + (1 - p) * (1 - p).log()) / math.log(2)
 
-        if denom < eps:
-            return 0.5   # 두 헤드 모두 완전 확실 → 동등 가중치
-        return h_sem / denom   # H_sem 클수록 α↓ (semantic 불확실 → instance 선호)
+        h_inst = _binary_entropy(inst_logits)            # (H, W), range [0, 1]
+        h_sem  = _binary_entropy(sem_logits)             # (H, W), range [0, 1]
+
+        conf_inst = 1.0 - h_inst                         # confidence = 1 - entropy
+        conf_sem  = 1.0 - h_sem
+        total     = (conf_inst + conf_sem).clamp(min=eps)
+        return conf_inst / total                         # α_map: inst 확실할수록 α↑
 
     def _inference_single_view(self, image):
         """Run inference on a single PIL image."""
@@ -271,12 +273,12 @@ class SegEarthOV3(Model):
                     )
 
                 elif self.fusion_mode == "entropy":
-                    alpha = self._compute_entropy_alpha(
+                    alpha_map = self._compute_entropy_alpha(
                         inst_logits, semantic_logits
                     )
                     seg_logits[query_idx] = (
-                        alpha * inst_logits.float()
-                        + (1.0 - alpha) * semantic_logits.float()
+                        alpha_map * inst_logits.float()
+                        + (1.0 - alpha_map) * semantic_logits.float()
                     )
 
 
