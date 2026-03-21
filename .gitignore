@@ -20,7 +20,7 @@ build/
 # Environment
 .env
 .venv/
-env/
+# env/
 venv/
 
 # IDE

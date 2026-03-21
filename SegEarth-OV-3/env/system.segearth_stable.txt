@@ -1,0 +1,44 @@
+### DATE
+Sat Jan 31 17:53:53 KST 2026
+### CONDA ENV
+
+# conda environments:
+#
+# * -> active
+# + -> frozen
+base                     /home/yeon030108/miniconda3
+segearth_anylabeling     /home/yeon030108/miniconda3/envs/segearth_anylabeling
+segearth_stable      *   /home/yeon030108/miniconda3/envs/segearth_stable
+
+### PYTHON
+/home/yeon030108/miniconda3/envs/segearth_stable/bin/python
+Python 3.10.19
+### PIP
+/home/yeon030108/miniconda3/envs/segearth_stable/bin/pip
+pip 26.0 from /home/yeon030108/miniconda3/envs/segearth_stable/lib/python3.10/site-packages/pip (python 3.10)
+### CUDA (nvidia-smi)
+Sat Jan 31 17:53:54 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 575.64.04              Driver Version: 577.00         CUDA Version: 12.9     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 3070        On  |   00000000:05:00.0  On |                  N/A |
+|  0%   49C    P8             29W /  240W |    1824MiB /   8192MiB |      2%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+### TORCH
+torch 2.4.1+cu121
+cuda available True
+cuda 12.1
+gpu NVIDIA GeForce RTX 3070
