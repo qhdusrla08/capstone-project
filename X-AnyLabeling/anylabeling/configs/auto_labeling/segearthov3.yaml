@@ -33,3 +33,16 @@ things_categories:
  # - ship
  # - airplane
  # - vehicle
+
+# --- Multi-scale Adapter (Novelty 1) 설정 ---
+# adapter_mode:       "off"  → 어댑터 비활성화 (기본값, 기존 동작 유지)
+#                     "hook" → Forward Hook 기반 추론 전용 모드 (가중치 무작위 초기화, scale=0)
+#                     "full" → 학습된 어댑터 가중치 로드 모드
+adapter_mode: "off"
+
+# adapter_bottleneck: RSAdapter 병목 차원 (기본 64 → 학습 파라미터 ~4.2M)
+adapter_bottleneck: 64
+
+# adapter_path: 학습된 어댑터+FPN 가중치 파일 경로 (full 모드에서만 사용)
+# adapter_path: /home/yeon030108/capstone/SegEarth-OV-3/rs_adapter/adapter_ckpt.pt
+adapter_path: ""

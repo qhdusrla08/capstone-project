@@ -6,6 +6,7 @@ import tempfile
 import cv2
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image as PILImage
 from PyQt5 import QtCore
@@ -74,6 +75,14 @@ class SegEarthOV3(Model):
         )
         self.things_set = set(c.lower() for c in things_categories)
 
+        # ── [ADDED] Multi-scale Adapter 설정 파싱 ──────────────────────────────
+        # adapter_mode: "off"  → RSAdapter 비활성화 (기존 동작 유지)
+        #               "hook" → Forward Hook 기반 추론 전용 모드
+        #               "full" → 학습된 어댑터 가중치 로드 모드
+        self.adapter_mode       = self.config.get("adapter_mode", "off")
+        self.adapter_bottleneck = self.config.get("adapter_bottleneck", 64)
+        self.adapter_path       = self.config.get("adapter_path", "")
+
         # Validate paths
         if not os.path.isdir(segearthov3_path):
             raise FileNotFoundError(
@@ -116,6 +125,75 @@ class SegEarthOV3(Model):
         # Parse class names (support comma-separated synonyms)
         self._parse_classes()
         self._build_alpha_vector()  # [ADDED] 카테고리별 α 벡터 사전 계산 (heuristic 모드용)
+
+        # ── [ADDED] Multi-scale Adapter 모듈 초기화 + Forward Hook 등록 ─────────
+        # sam3_model, segearthov3_path, self.device 모두 이 시점에 유효하다.
+        if self.adapter_mode in ("hook", "full"):
+            adapter_dir = os.path.join(segearthov3_path, "rs_adapter")
+            if adapter_dir not in sys.path:
+                sys.path.insert(0, adapter_dir)
+            from rs_adapter import RSAdapter, RSMultiscaleFPN
+
+            # ViT 블록 리스트 접근
+            # sam3_model.backbone           → SAM3VLBackbone (vl_combiner.py)
+            # .vision_backbone              → Sam3DualViTDetNeck (necks.py)
+            # .trunk                        → ViT (vitdet.py)
+            # .blocks                       → nn.ModuleList (len=32)
+            vit_trunk = sam3_model.backbone.vision_backbone.trunk
+            self._vit_blocks = vit_trunk.blocks  # nn.ModuleList, len=32
+
+            # RSAdapter 초기화 (블록 수만큼)
+            self._adapters = nn.ModuleList([
+                RSAdapter(d_model=1024, bottleneck=self.adapter_bottleneck)
+                for _ in range(len(self._vit_blocks))
+            ]).to(self.device)
+
+            # FPN 모듈 초기화
+            self._fpn = RSMultiscaleFPN(in_channels=1024, out_channels=256).to(self.device)
+
+            # 학습된 가중치 로드 (full 모드, 경로가 지정된 경우)
+            if self.adapter_path and os.path.isfile(self.adapter_path):
+                ckpt = torch.load(self.adapter_path, map_location=self.device)
+                self._adapters.load_state_dict(ckpt.get("adapters", ckpt))
+                self._fpn.load_state_dict(ckpt.get("fpn", {}), strict=False)
+                logger.info(f"RSAdapter 가중치 로드 완료: {self.adapter_path}")
+
+            # SAM3 파라미터 동결 (어댑터 + FPN만 학습 가능)
+            for param in sam3_model.parameters():
+                param.requires_grad = False
+            for param in self._adapters.parameters():
+                param.requires_grad = True
+            for param in self._fpn.parameters():
+                param.requires_grad = True
+
+            # ── Forward Hook 등록 ────────────────────────────────────────────
+            # 체크포인트 블록(7, 15, 23, 31): 출력 포착 + 어댑터 적용
+            # 나머지 블록: 어댑터 적용만
+            # PyTorch hook이 None이 아닌 값을 반환하면 해당 값이 블록 출력을 대체한다.
+            self._hook_feats = {}
+            self._hooks = []
+            checkpoint_blocks = {7: "f7", 15: "f15", 23: "f23", 31: "f31"}
+
+            def _make_hook(adapter_module, feat_key):
+                def _hook(module, input, output):
+                    adapted = adapter_module(output)
+                    self._hook_feats[feat_key] = adapted.detach()
+                    return adapted
+                return _hook
+
+            for blk_idx, feat_key in checkpoint_blocks.items():
+                hook = self._vit_blocks[blk_idx].register_forward_hook(
+                    _make_hook(self._adapters[blk_idx], feat_key)
+                )
+                self._hooks.append(hook)
+
+            non_checkpoint = set(range(len(self._vit_blocks))) - set(checkpoint_blocks.keys())
+            for blk_idx in non_checkpoint:
+                adapter = self._adapters[blk_idx]
+                hook = self._vit_blocks[blk_idx].register_forward_hook(
+                    lambda m, i, o, a=adapter: a(o)
+                )
+                self._hooks.append(hook)
 
         on_message(
             self.tr("SegEarth-OV-3 model loaded successfully.")
@@ -199,7 +277,27 @@ class SegEarthOV3(Model):
         with torch.no_grad(), torch.autocast(
             device_type="cuda", dtype=torch.bfloat16
         ):
+            # set_image() 호출 전 hook 수집 버퍼를 초기화한다.
+            # (슬라이딩 윈도우 모드에서 패치마다 새 피처를 수집하기 위해 필수)
+            if self.adapter_mode in ("hook", "full"):
+                self._hook_feats.clear()
             inference_state = self.processor.set_image(image)
+
+            # ── [ADDED] Multi-scale Adapter FPN 퓨전 ─────────────────────────
+            # set_image() 내부 ViT forward 중 hook이 실행 → _hook_feats에 중간 피처 수집
+            # 4개 체크포인트 블록(7,15,23,31) 피처가 모두 수집된 경우에만 FPN 적용
+            if self.adapter_mode in ("hook", "full") and len(self._hook_feats) == 4:
+                fpn_out = self._fpn(self._hook_feats)
+                # P4 (72×72, 256ch)를 기존 vision_features 자리에 주입
+                # → Transformer Encoder가 이 피처를 크로스 어텐션에 사용
+                inference_state["backbone_out"]["vision_features"] = fpn_out["p4"]
+                # backbone_fpn 전체도 교체 (멀티레벨 어텐션 확장 대비)
+                inference_state["backbone_out"]["backbone_fpn"] = [
+                    fpn_out["p2"],  # (B, 256, 288, 288)
+                    fpn_out["p3"],  # (B, 256, 144, 144)
+                    fpn_out["p4"],  # (B, 256, 72,  72)
+                    fpn_out["p5"],  # (B, 256, 36,  36)
+                ]
 
             for query_idx, query_word in enumerate(self.query_words):
                 self.processor.reset_all_prompts(inference_state)
@@ -446,6 +544,16 @@ class SegEarthOV3(Model):
 
     def unload(self):
         """Release GPU memory."""
+        # [ADDED] forward hook 해제 (메모리 누수 방지)
+        if hasattr(self, "_hooks"):
+            for hook in self._hooks:
+                hook.remove()
+            self._hooks.clear()
+
         if hasattr(self, "processor"):
             del self.processor
+        if hasattr(self, "_adapters"):
+            del self._adapters
+        if hasattr(self, "_fpn"):
+            del self._fpn
         torch.cuda.empty_cache()
