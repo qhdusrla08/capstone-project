@@ -99,16 +99,13 @@ class LoveDADataset(Dataset):
 
     def __init__(self, root: str, split: str = "Train", resolution: int = 1008):
         self.resolution = resolution
-        self.img_paths, self.mask_paths = [], []
-        for domain in ["Urban", "Rural"]:
-            imgs  = sorted(glob.glob(
-                os.path.join(root, split, domain, "images_png", "*.png")))
-            masks = sorted(glob.glob(
-                os.path.join(root, split, domain, "masks_png", "*.png")))
-            assert len(imgs) == len(masks), \
-                f"이미지({len(imgs)})와 마스크({len(masks)}) 수 불일치: {domain}"
-            self.img_paths  += imgs
-            self.mask_paths += masks
+        split_lower = split.lower()  # "Train" → "train", "Val" → "val"
+        img_dir  = os.path.join(root, f"urban:rural {split_lower} images")
+        mask_dir = os.path.join(root, f"urban:rural {split_lower} masks")
+        self.img_paths  = sorted(glob.glob(os.path.join(img_dir,  "*.png")))
+        self.mask_paths = sorted(glob.glob(os.path.join(mask_dir, "*.png")))
+        assert len(self.img_paths) == len(self.mask_paths), \
+            f"이미지({len(self.img_paths)})와 마스크({len(self.mask_paths)}) 수 불일치"
 
         # SAM3와 동일한 전처리 (sam3_image_processor.py 참조)
         self.img_transform = v2.Compose([
