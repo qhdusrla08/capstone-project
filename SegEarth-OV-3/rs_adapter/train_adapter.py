@@ -27,6 +27,7 @@ import sys
 import os
 import argparse
 import glob
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -71,7 +72,18 @@ parser.add_argument("--resume", default="",
                     help="이어 학습할 체크포인트 경로")
 parser.add_argument("--log_dir", default="./runs/adapter",
                     help="TensorBoard 로그 디렉토리")
+parser.add_argument("--seed", type=int, default=42,
+                    help="재현성을 위한 글로벌 랜덤 시드")
 args = parser.parse_args()
+
+# ── 시드 고정 ────────────────────────────────────────────────────────────────
+random.seed(args.seed)
+np.random.seed(args.seed)
+torch.manual_seed(args.seed)
+torch.cuda.manual_seed_all(args.seed)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark     = False
+print(f"[Seed] {args.seed}")
 
 # ── 경로 설정 ────────────────────────────────────────────────────────────────
 sys.path.insert(0, args.segearthov3_path)
@@ -290,13 +302,23 @@ sam3_model.eval()   # BN/Dropout 동결 (ViT에는 없지만 안전하게)
 # ── DataLoader 구성 ──────────────────────────────────────────────────────────
 print("[2/4] 데이터셋 준비 중...")
 train_ds, val_ds, num_classes, class_names = build_dataset(args)
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+g = torch.Generator()
+g.manual_seed(args.seed)
+
 train_loader = DataLoader(
     train_ds, batch_size=args.batch_size, shuffle=True,
     num_workers=args.num_workers, pin_memory=True, drop_last=True,
+    worker_init_fn=seed_worker, generator=g,
 )
 val_loader = DataLoader(
     val_ds, batch_size=1, shuffle=False,
     num_workers=args.num_workers, pin_memory=True,
+    worker_init_fn=seed_worker,
 )
 print(f"  Train: {len(train_ds)}장 | Val: {len(val_ds)}장 | Classes: {num_classes}")
 
