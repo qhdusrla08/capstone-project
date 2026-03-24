@@ -53,6 +53,8 @@ parser.add_argument("--bottleneck", type=int, default=64,
                     help="RSAdapter 병목 차원")
 parser.add_argument("--no_adapter", action="store_true",
                     help="Adapter 없이 FPN+Head만 학습 (baseline용)")
+parser.add_argument("--no_fpn", action="store_true",
+                    help="FPN 없이 SAM3 vision_features 직접 사용 (ablation용)")
 parser.add_argument("--lr", type=float, default=1e-3,
                     help="학습률 (AdamW)")
 parser.add_argument("--epochs", type=int, default=20,
@@ -316,12 +318,13 @@ cls_head = nn.Conv2d(256, num_classes, kernel_size=1).to(device)
 # 학습 가능 파라미터만 옵티마이저에 등록
 trainable_params = (
     ([] if args.no_adapter else list(adapters.parameters()))
-    + list(fpn.parameters())
+    + ([] if args.no_fpn else list(fpn.parameters()))
     + list(cls_head.parameters())
 )
 total_trainable = sum(p.numel() for p in trainable_params)
-adapter_status = "비활성화 (baseline)" if args.no_adapter else "활성화"
-print(f"  학습 파라미터: {total_trainable / 1e6:.2f}M / SAM3 동결 / Adapter {adapter_status}")
+adapter_status = "비활성화" if args.no_adapter else "활성화"
+fpn_status     = "비활성화" if args.no_fpn     else "활성화"
+print(f"  학습 파라미터: {total_trainable / 1e6:.2f}M / SAM3 동결 / Adapter {adapter_status} / FPN {fpn_status}")
 
 # ── 이어 학습 (resume) ───────────────────────────────────────────────────────
 start_epoch = 0
@@ -341,10 +344,11 @@ hook_feats: dict = {}
 hooks = []
 checkpoint_blocks = {7: "f7", 15: "f15", 23: "f23", 31: "f31"}
 
-def make_hook(adapter_module: nn.Module, feat_key: str | None, use_adapter: bool = True):
+def make_hook(adapter_module: nn.Module, feat_key: str | None,
+              use_adapter: bool = True, store_feat: bool = True):
     def _hook(_module, _input, output):
         adapted = adapter_module(output) if use_adapter else output  # Adapter bypass 가능
-        if feat_key is not None:
+        if feat_key is not None and store_feat:
             hook_feats[feat_key] = adapted      # .detach() 없음 → FPN까지 gradient 흐름
         return adapted                          # 블록 출력 교체
     return _hook
@@ -352,7 +356,9 @@ def make_hook(adapter_module: nn.Module, feat_key: str | None, use_adapter: bool
 for blk_idx in range(len(vit_blocks)):
     feat_key = checkpoint_blocks.get(blk_idx)
     hook = vit_blocks[blk_idx].register_forward_hook(
-        make_hook(adapters[blk_idx], feat_key, use_adapter=not args.no_adapter)
+        make_hook(adapters[blk_idx], feat_key,
+                  use_adapter=not args.no_adapter,
+                  store_feat=not args.no_fpn)
     )
     hooks.append(hook)
 
@@ -395,21 +401,24 @@ for epoch in range(start_epoch, args.epochs):
             # hook이 ViT 각 블록 forward 중 실행되어 hook_feats에 F7/F15/F23/F31 저장
             backbone_out = sam3_model.backbone.forward_image(images)
 
-            # FPN 퓨전: (B,1024,72,72) 중간 피처 → (B,256,72,72) P4
-            fpn_out = fpn(hook_feats)
+            if args.no_fpn:
+                # FPN 없이 SAM3 native vision_features 직접 사용
+                vis_feat = backbone_out["vision_features"].float()  # (B, 256, H, W)
+            else:
+                # FPN 퓨전: (B,1024,72,72) 중간 피처 → (B,256,72,72) P4
+                fpn_out = fpn(hook_feats)
+                backbone_out["vision_features"] = fpn_out["p4"]
+                backbone_out["backbone_fpn"] = [
+                    fpn_out["p2"],  # (B, 256, 288, 288)
+                    fpn_out["p3"],  # (B, 256, 144, 144)
+                    fpn_out["p4"],  # (B, 256, 72,  72)
+                    fpn_out["p5"],  # (B, 256, 36,  36)
+                ]
+                vis_feat = fpn_out["p4"].float()
 
-            # vision_features 교체 (Transformer Encoder 입력)
-            backbone_out["vision_features"] = fpn_out["p4"]
-            backbone_out["backbone_fpn"] = [
-                fpn_out["p2"],  # (B, 256, 288, 288)
-                fpn_out["p3"],  # (B, 256, 144, 144)
-                fpn_out["p4"],  # (B, 256, 72,  72)
-                fpn_out["p5"],  # (B, 256, 36,  36)
-            ]
-
-            # 분류 헤드: P4 업샘플 → 픽셀 분류
+            # 분류 헤드: 업샘플 → 픽셀 분류
             vis_up = F.interpolate(
-                fpn_out["p4"].float(),
+                vis_feat,
                 size=(args.resolution, args.resolution),
                 mode="bilinear", align_corners=False,
             )                                                       # (B, 256, 1008, 1008)
@@ -454,9 +463,13 @@ for epoch in range(start_epoch, args.epochs):
 
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
                 backbone_out = sam3_model.backbone.forward_image(images)
-                fpn_out      = fpn(hook_feats)
-                vis_up       = F.interpolate(
-                    fpn_out["p4"].float(),
+                if args.no_fpn:
+                    vis_feat = backbone_out["vision_features"].float()
+                else:
+                    fpn_out  = fpn(hook_feats)
+                    vis_feat = fpn_out["p4"].float()
+                vis_up = F.interpolate(
+                    vis_feat,
                     size=(args.resolution, args.resolution),
                     mode="bilinear", align_corners=False,
                 )
