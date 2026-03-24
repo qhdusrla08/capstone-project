@@ -51,6 +51,8 @@ parser.add_argument("--dataset", default="loveda",
                     help="학습 데이터셋 선택")
 parser.add_argument("--bottleneck", type=int, default=64,
                     help="RSAdapter 병목 차원")
+parser.add_argument("--no_adapter", action="store_true",
+                    help="Adapter 없이 FPN+Head만 학습 (baseline용)")
 parser.add_argument("--lr", type=float, default=1e-3,
                     help="학습률 (AdamW)")
 parser.add_argument("--epochs", type=int, default=20,
@@ -313,12 +315,13 @@ cls_head = nn.Conv2d(256, num_classes, kernel_size=1).to(device)
 
 # 학습 가능 파라미터만 옵티마이저에 등록
 trainable_params = (
-    list(adapters.parameters())
+    ([] if args.no_adapter else list(adapters.parameters()))
     + list(fpn.parameters())
     + list(cls_head.parameters())
 )
 total_trainable = sum(p.numel() for p in trainable_params)
-print(f"  학습 파라미터: {total_trainable / 1e6:.2f}M / SAM3 동결")
+adapter_status = "비활성화 (baseline)" if args.no_adapter else "활성화"
+print(f"  학습 파라미터: {total_trainable / 1e6:.2f}M / SAM3 동결 / Adapter {adapter_status}")
 
 # ── 이어 학습 (resume) ───────────────────────────────────────────────────────
 start_epoch = 0
@@ -338,9 +341,9 @@ hook_feats: dict = {}
 hooks = []
 checkpoint_blocks = {7: "f7", 15: "f15", 23: "f23", 31: "f31"}
 
-def make_hook(adapter_module: nn.Module, feat_key: str | None):
+def make_hook(adapter_module: nn.Module, feat_key: str | None, use_adapter: bool = True):
     def _hook(_module, _input, output):
-        adapted = adapter_module(output)        # RSAdapter forward (gradient 유지)
+        adapted = adapter_module(output) if use_adapter else output  # Adapter bypass 가능
         if feat_key is not None:
             hook_feats[feat_key] = adapted      # .detach() 없음 → FPN까지 gradient 흐름
         return adapted                          # 블록 출력 교체
@@ -349,7 +352,7 @@ def make_hook(adapter_module: nn.Module, feat_key: str | None):
 for blk_idx in range(len(vit_blocks)):
     feat_key = checkpoint_blocks.get(blk_idx)
     hook = vit_blocks[blk_idx].register_forward_hook(
-        make_hook(adapters[blk_idx], feat_key)
+        make_hook(adapters[blk_idx], feat_key, use_adapter=not args.no_adapter)
     )
     hooks.append(hook)
 
