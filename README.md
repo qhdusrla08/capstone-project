@@ -7,7 +7,7 @@
 
 ## Overview
 
-This project extends SegEarth-OV-3, a state-of-the-art Open-Vocabulary Semantic Segmentation (OVSS) model for remote sensing imagery. The original model uses a frozen SAM3 visual encoder with CLIP-based text-image similarity for zero-shot segmentation.
+This project extends SegEarth-OV-3, a state-of-the-art Open-Vocabulary Semantic Segmentation (OVSS) model for remote sensing imagery. The original model uses SAM3's visual backbone with a built-in language backbone and a cross-modal transformer decoder for zero-shot grounding-based segmentation.
 
 **Core contributions of this project:**
 
@@ -74,8 +74,8 @@ SAM3 ViT Encoder (frozen, 840M params)
                 │
     ┌───────────┴───────────────────────────────┐
     │ Closed-set (PEFT training)                │  Open-Vocabulary (OVSS inference)
-    │ 1×1 Conv Head → logits                   │  SAM3 Dual-Head × text embeddings
-    │                                           │  → Category-Adaptive Fusion
+    │ 1×1 Conv Head → logits                   │  SAM3 language_backbone + cross-modal decoder
+    │                                           │  → Dual-Head → Category-Adaptive Fusion
     └───────────────────────────────────────────┘
                 │
                 ▼
