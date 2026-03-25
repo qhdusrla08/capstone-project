@@ -44,7 +44,7 @@ capstone/
 
 ### Full Pipeline
 
-![Adapter + FPN Architecture]('revised Architecture.png')
+![Adapter + FPN Architecture](revised%20Architecture.png)
 
 > **Multi-scale Adapter with FPN Fusion:** Lightweight bottleneck adapters (~0.5% of SAM3's 840M parameters) are inserted into all 32 ViT blocks via forward hooks. Intermediate features from global-attention checkpoints (Blocks 7, 15, 23, 31) are aggregated through an FPN-style top-down pathway to produce a four-level feature pyramid (P2–P5), injecting RS domain knowledge while preserving pretrained representations.
 
