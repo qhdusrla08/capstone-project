@@ -10,7 +10,7 @@ class RSAdapter(nn.Module):
 
     파라미터 수:
         d_model=1024, bottleneck=64  →  1024×64 + 64×1024 ≈ 131K
-        32블록 전체 삽입 시 ~4.2M 파라미터 (SAM3 전체의 ~2%)
+        32블록 전체 삽입 시 ~4.2M 파라미터 (SAM3 전체 840M의 ~0.5%)
     """
 
     def __init__(self, d_model: int = 1024, bottleneck: int = 64):

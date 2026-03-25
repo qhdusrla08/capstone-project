@@ -44,11 +44,15 @@ capstone/
 
 ### Full Pipeline
 
+![Adapter + FPN Architecture](Adapter_FPN_Architecture.png)
+
+> **Multi-scale Adapter with FPN Fusion:** Lightweight bottleneck adapters (~0.5% of SAM3's 840M parameters) are inserted into all 32 ViT blocks via forward hooks. Intermediate features from global-attention checkpoints (Blocks 7, 15, 23, 31) are aggregated through an FPN-style top-down pathway to produce a four-level feature pyramid (P2–P5), injecting RS domain knowledge while preserving pretrained representations.
+
 ```
 Input Image
     │
     ▼
-SAM3 ViT Encoder (frozen, 316M params)
+SAM3 ViT Encoder (frozen, 840M params)
     │   ┌─────────────────────────────────┐
     │   │  RSAdapter ×32 (~4.2M, trained) │  ← PEFT: RS domain knowledge injection
     │   │  (bottleneck: Linear 1024→64→1024, scale=0 init)
@@ -88,7 +92,7 @@ x → Linear(1024→64) → GELU → Linear(64→1024) → × scale → + x
 
 - `scale` initialized to `0`: identity at start, enabling stable PEFT training
 - `adapted.to(x.dtype)`: handles bfloat16/float32 mixed precision
-- **Parameters**: ~131K per block × 32 blocks = **~4.2M total** (~1.3% of SAM3)
+- **Parameters**: ~131K per block × 32 blocks = **~4.2M total** (~0.5% of SAM3)
 
 ### RSMultiscaleFPN
 
@@ -171,20 +175,40 @@ This component will extend the OVSS inference pipeline end-to-end without requir
 
 Evaluates visual feature quality of SAM3 + Adapter + FPN via supervised segmentation on LoveDA (7 classes).
 
+**Ablation configuration:**
+
+| Exp | Adapter | FPN | Flags | Trainable Params |
+|-----|:-------:|:---:|-------|-----------------|
+| Baseline | ✗ | ✗ | `--no_adapter --no_fpn` | Head (~0.002M) |
+| +FPN only | ✗ | ✓ | `--no_adapter` | FPN + Head (~3.4M) |
+| +Adapter only | ✓ | ✗ | `--no_fpn` | Adapter + Head (~4.2M) |
+| +FPN+Adapter | ✓ | ✓ | (default) | Adapter + FPN + Head (~7.6M) |
+
+**Results (Val mIoU):**
+
+| | With Adapter | Without Adapter (`--no_adapter`) |
+|---|:---:|:---:|
+| FPN | **0.6384** | 0.6162 |
+| No FPN (`--no_fpn`) | 0.6324 | 0.4905 |
+
+**Summary:**
+
 | Exp | Adapter | FPN | Params | Val mIoU |
 |-----|:-------:|:---:|-------:|:--------:|
-| Baseline | ✗ | ✗ | ~0.002M | — |
-| + FPN only | ✗ | ✓ | ~3.4M | in progress |
-| + Adapter only | ✓ | ✗ | ~4.2M | — |
-| **+ FPN + Adapter** | ✓ | ✓ | **~7.6M** | **0.6215** |
+| Baseline | ✗ | ✗ | ~0.002M | 0.4905 |
+| +FPN only | ✗ | ✓ | ~3.4M | 0.6162 |
+| +Adapter only | ✓ | ✗ | ~4.2M | 0.6324 |
+| **+FPN+Adapter** | ✓ | ✓ | **~7.6M** | **0.6384** |
 
-**Class-wise Val IoU (FPN + Adapter, best checkpoint):**
+> FPN contributes the largest single gain (+0.126 mIoU over Baseline). RSAdapter adds an additional +0.022 on top of FPN. Without FPN, the adapter alone still improves significantly over Baseline (+0.142).
+
+**Class-wise Val IoU — +FPN+Adapter best checkpoint (Epoch 7):**
 
 | Background | Building | Road | Water | Barren | Forest | Agricultural |
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 0.9954 | 0.5020 | 0.6183 | 0.5093 | 0.7182 | 0.3150 | 0.5933 |
+| 0.9940 | 0.5171 | 0.6669 | 0.5222 | 0.7277 | 0.4108 | 0.6304 |
 
-> Note: Forest IoU is the lowest (0.315), reflecting spectral confusion with Agricultural. FPN's p2 layer (288×288) is expected to improve fine-boundary classes in subsequent experiments.
+> Forest IoU (0.411) remains the lowest, likely due to spectral confusion with Agricultural. Best checkpoint was reached at Epoch 7/20, suggesting early convergence.
 
 ### Phase 2 — OVSS Baseline (planned)
 
@@ -243,16 +267,15 @@ SegEarth-OV-3/weights/sam3/sam3.pt   # 3.3 GB
 
 ### Dataset (LoveDA)
 
+Downloaded from HuggingFace. Urban and Rural scenes are mixed within each split.
+
 ```
 datasets/LoveDA/
-├── Train/
-│   ├── Urban/
-│   │   ├── images_png/   # RGB .png (1024×1024)
-│   │   └── masks_png/    # Label .png (0–6)
-│   └── Rural/
-└── Val/
-    ├── Urban/
-    └── Rural/
+├── .cache/
+├── urban:rural train images/   # RGB .png (1024×1024), urban + rural mixed
+├── urban:rural train masks/    # Label .png (0–6), urban + rural mixed
+├── urban:rural val images/     # RGB .png (1024×1024), urban + rural mixed
+└── urban:rural val masks/      # Label .png (0–6), urban + rural mixed
 ```
 
 ---
@@ -371,7 +394,7 @@ adapter_bottleneck: 64
 - [x] PEFT training pipeline (LoveDA, iSAID support)
 - [x] Category-Adaptive Fusion (heuristic + entropy)
 - [x] X-AnyLabeling integration
-- [x] Closed-set ablation: complete 4-way comparison (Baseline / FPN / Adapter / FPN+Adapter)
+- [x] Closed-set ablation: complete 4-way comparison (Baseline 0.4905 / +FPN 0.6162 / +Adapter 0.6324 / +FPN+Adapter 0.6384)
 - [ ] OVSS baseline evaluation on LoveDA
 - [ ] OVSS + Adapter: measure domain adaptation effect on zero-shot setting
 - [ ] Full ablation table: Fusion × Adapter × OVSS
@@ -383,7 +406,7 @@ adapter_bottleneck: 64
 ## References
 
 - SegEarth-OV-3: [earth-insights/SegEartg-OV-3](https://github.com/earth-insights/SegEarth-OV-3)
-- SAM3: Segment Anything Model 3 [facebookresearch/sam3] (https://github.com/facebookresearch/sam3)
+- SAM3: [facebookresearch/sam3] (https://github.com/facebookresearch/sam3)
 - X-AnyLabeling: [CVHub520/X-AnyLabeling](https://github.com/CVHub520/X-AnyLabeling)
 - LoveDA Dataset: [LoveDA: A Remote Sensing Land-Cover Dataset](https://github.com/Junjue-Wang/LoveDA)
 - iSAID Dataset: [iSAID: A Large-scale Dataset for Instance Segmentation](https://captain-whu.github.io/iSAID/)
