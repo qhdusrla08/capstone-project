@@ -115,11 +115,14 @@ class LoveDADataset(Dataset):
 
     def __init__(self, root: str, split: str = "Train", resolution: int = 1008):
         self.resolution = resolution
-        split_lower = split.lower()  # "Train" → "train", "Val" → "val"
-        img_dir  = os.path.join(root, f"urban:rural {split_lower} images")
-        mask_dir = os.path.join(root, f"urban:rural {split_lower} masks")
-        self.img_paths  = sorted(glob.glob(os.path.join(img_dir,  "*.png")))
-        self.mask_paths = sorted(glob.glob(os.path.join(mask_dir, "*.png")))
+        split_map = {"Train": "train", "Val": "validation"}
+        split_dir = split_map.get(split, split.lower())
+        self.img_paths, self.mask_paths = [], []
+        for domain in ["Urban", "Rural"]:
+            imgs  = sorted(glob.glob(os.path.join(root, split_dir, domain, "images_png", "*.png")))
+            masks = sorted(glob.glob(os.path.join(root, split_dir, domain, "masks_png", "*.png")))
+            self.img_paths.extend(imgs)
+            self.mask_paths.extend(masks)
         assert len(self.img_paths) == len(self.mask_paths), \
             f"이미지({len(self.img_paths)})와 마스크({len(self.mask_paths)}) 수 불일치"
 
