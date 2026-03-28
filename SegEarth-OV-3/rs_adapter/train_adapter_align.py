@@ -108,8 +108,10 @@ class LoveDADataset(Dataset):
     CLASS_NAMES = ["Background", "Building", "Road", "Water",
                    "Barren", "Forest", "Agricultural"]
 
-    def __init__(self, root: str, split: str = "Train", resolution: int = 1008):
+    def __init__(self, root: str, split: str = "Train", resolution: int = 1008,
+                 augment: bool = False):
         self.resolution = resolution
+        self.augment    = augment
         split_map = {"Train": "train", "Val": "validation"}
         split_dir = split_map.get(split, split.lower())
         self.img_paths, self.mask_paths = [], []
@@ -121,8 +123,7 @@ class LoveDADataset(Dataset):
         assert len(self.img_paths) == len(self.mask_paths), \
             f"이미지({len(self.img_paths)})와 마스크({len(self.mask_paths)}) 수 불일치"
 
-        self.img_transform = v2.Compose([
-            v2.Resize((resolution, resolution)),
+        self.normalize = v2.Compose([
             v2.ToDtype(torch.float32, scale=True),
             v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ])
@@ -133,19 +134,48 @@ class LoveDADataset(Dataset):
     def __getitem__(self, idx):
         img  = Image.open(self.img_paths[idx]).convert("RGB")
         mask = Image.open(self.mask_paths[idx])
-        img_t = self.img_transform(
-            v2.functional.to_image(img).to(torch.uint8)
-        )
-        mask_np = np.array(
-            mask.resize((self.resolution, self.resolution), Image.NEAREST),
-            dtype=np.int64
-        )
+
+        if self.augment:
+            scale = random.choice([0.75, 1.0, 1.25, 1.5])
+            orig_w, orig_h = img.size
+            scaled_h = int(orig_h * scale)
+            scaled_w = int(orig_w * scale)
+            img  = img.resize((scaled_w, scaled_h), Image.BILINEAR)
+            mask = mask.resize((scaled_w, scaled_h), Image.NEAREST)
+            if scaled_h >= self.resolution and scaled_w >= self.resolution:
+                top  = random.randint(0, scaled_h - self.resolution)
+                left = random.randint(0, scaled_w - self.resolution)
+                img  = img.crop((left, top, left + self.resolution, top + self.resolution))
+                mask = mask.crop((left, top, left + self.resolution, top + self.resolution))
+            else:
+                img  = img.resize((self.resolution, self.resolution), Image.BILINEAR)
+                mask = mask.resize((self.resolution, self.resolution), Image.NEAREST)
+        else:
+            img  = img.resize((self.resolution, self.resolution), Image.BILINEAR)
+            mask = mask.resize((self.resolution, self.resolution), Image.NEAREST)
+
+        img_t   = self.normalize(v2.functional.to_image(img).to(torch.uint8))
+        mask_np = np.array(mask, dtype=np.int64)
         # LoveDA 공식 포맷: 0=nodata, 1=background, ..., 7=agricultural
         # mmseg reduce_zero_label 동일 처리: 0→255(ignore), 1~7→0~6
-        nodata = (mask_np == 0)
+        nodata  = (mask_np == 0)
         mask_np = mask_np - 1
         mask_np[nodata] = 255
-        return img_t, torch.from_numpy(mask_np)
+        mask_t  = torch.from_numpy(mask_np)
+
+        if self.augment:
+            if torch.rand(1).item() < 0.5:
+                img_t  = v2.functional.horizontal_flip(img_t)
+                mask_t = v2.functional.horizontal_flip(mask_t.unsqueeze(0)).squeeze(0)
+            if torch.rand(1).item() < 0.5:
+                img_t  = v2.functional.vertical_flip(img_t)
+                mask_t = v2.functional.vertical_flip(mask_t.unsqueeze(0)).squeeze(0)
+            k = random.randint(0, 3)                                # 0°/90°/180°/270°
+            if k > 0:
+                img_t  = torch.rot90(img_t,  k, dims=[1, 2])       # (C, H, W)
+                mask_t = torch.rot90(mask_t, k, dims=[0, 1])       # (H, W)
+
+        return img_t, mask_t
 
 
 class ISAIDDataset(Dataset):
@@ -189,8 +219,8 @@ class ISAIDDataset(Dataset):
 
 def build_dataset(args):
     if args.dataset == "loveda":
-        train_ds = LoveDADataset(args.data_root, split="Train", resolution=args.resolution)
-        val_ds   = LoveDADataset(args.data_root, split="Val",   resolution=args.resolution)
+        train_ds = LoveDADataset(args.data_root, split="Train", resolution=args.resolution, augment=True)
+        val_ds   = LoveDADataset(args.data_root, split="Val",   resolution=args.resolution, augment=False)
         return train_ds, val_ds, LoveDADataset.NUM_CLASSES, LoveDADataset.CLASS_NAMES
     elif args.dataset == "isaid":
         train_ds = ISAIDDataset(args.data_root, split="train", resolution=args.resolution)
@@ -360,7 +390,7 @@ with torch.no_grad():
     for cls_name in class_names:
         text_out = sam3_model.backbone.forward_text([cls_name], device=str(device))
         # language_features: [seq_len, 1, 256] — 시퀀스 및 배치 차원 평균 → [256]
-        feat = text_out["language_features"][:, 0, :].mean(dim=0).float()
+        feat = text_out["language_features"][:, 0, :].mean(dim=0).float().to(device)
         text_feat_dict[cls_name] = feat
 
 skip_str = "(background 제외)" if args.align_skip_bg else "(background 포함)"

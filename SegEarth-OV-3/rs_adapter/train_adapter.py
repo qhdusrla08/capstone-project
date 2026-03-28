@@ -113,8 +113,10 @@ class LoveDADataset(Dataset):
     CLASS_NAMES = ["Background", "Building", "Road", "Water",
                    "Barren", "Forest", "Agricultural"]
 
-    def __init__(self, root: str, split: str = "Train", resolution: int = 1008):
+    def __init__(self, root: str, split: str = "Train", resolution: int = 1008,
+                 augment: bool = False):
         self.resolution = resolution
+        self.augment    = augment
         split_map = {"Train": "train", "Val": "validation"}
         split_dir = split_map.get(split, split.lower())
         self.img_paths, self.mask_paths = [], []
@@ -126,9 +128,8 @@ class LoveDADataset(Dataset):
         assert len(self.img_paths) == len(self.mask_paths), \
             f"이미지({len(self.img_paths)})와 마스크({len(self.mask_paths)}) 수 불일치"
 
-        # SAM3와 동일한 전처리 (sam3_image_processor.py 참조)
-        self.img_transform = v2.Compose([
-            v2.Resize((resolution, resolution)),
+        # Normalize only (Resize는 __getitem__에서 scale에 따라 처리)
+        self.normalize = v2.Compose([
             v2.ToDtype(torch.float32, scale=True),
             v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ])
@@ -140,19 +141,53 @@ class LoveDADataset(Dataset):
         img  = Image.open(self.img_paths[idx]).convert("RGB")
         mask = Image.open(self.mask_paths[idx])
 
-        img_t = self.img_transform(
+        if self.augment:
+            # Random scale: 0.75~1.5 중 선택 후 crop to resolution
+            scale = random.choice([0.75, 1.0, 1.25, 1.5])
+            orig_w, orig_h = img.size
+            scaled_h = int(orig_h * scale)
+            scaled_w = int(orig_w * scale)
+            img  = img.resize((scaled_w, scaled_h), Image.BILINEAR)
+            mask = mask.resize((scaled_w, scaled_h), Image.NEAREST)
+
+            if scaled_h >= self.resolution and scaled_w >= self.resolution:
+                top  = random.randint(0, scaled_h - self.resolution)
+                left = random.randint(0, scaled_w - self.resolution)
+                img  = img.crop((left, top,
+                                 left + self.resolution, top + self.resolution))
+                mask = mask.crop((left, top,
+                                  left + self.resolution, top + self.resolution))
+            else:
+                img  = img.resize((self.resolution, self.resolution), Image.BILINEAR)
+                mask = mask.resize((self.resolution, self.resolution), Image.NEAREST)
+        else:
+            img  = img.resize((self.resolution, self.resolution), Image.BILINEAR)
+            mask = mask.resize((self.resolution, self.resolution), Image.NEAREST)
+
+        img_t  = self.normalize(
             v2.functional.to_image(img).to(torch.uint8)
         )                                                           # (3, H, W) float32
-        mask_np = np.array(
-            mask.resize((self.resolution, self.resolution), Image.NEAREST),
-            dtype=np.int64
-        )
+
+        mask_np = np.array(mask, dtype=np.int64)
         # LoveDA 공식 포맷: 0=nodata, 1=background, ..., 7=agricultural
         # mmseg reduce_zero_label 동일 처리: 0→255(ignore), 1~7→0~6
-        nodata = (mask_np == 0)
+        nodata  = (mask_np == 0)
         mask_np = mask_np - 1
         mask_np[nodata] = 255
-        mask_t = torch.from_numpy(mask_np)                          # (H, W) int64
+        mask_t  = torch.from_numpy(mask_np)                         # (H, W) int64
+
+        if self.augment:
+            if torch.rand(1).item() < 0.5:
+                img_t  = v2.functional.horizontal_flip(img_t)
+                mask_t = v2.functional.horizontal_flip(mask_t.unsqueeze(0)).squeeze(0)
+            if torch.rand(1).item() < 0.5:
+                img_t  = v2.functional.vertical_flip(img_t)
+                mask_t = v2.functional.vertical_flip(mask_t.unsqueeze(0)).squeeze(0)
+            k = random.randint(0, 3)                                # 0°/90°/180°/270°
+            if k > 0:
+                img_t  = torch.rot90(img_t,  k, dims=[1, 2])       # (C, H, W)
+                mask_t = torch.rot90(mask_t, k, dims=[0, 1])       # (H, W)
+
         return img_t, mask_t
 
 
@@ -205,9 +240,9 @@ class ISAIDDataset(Dataset):
 def build_dataset(args):
     if args.dataset == "loveda":
         train_ds = LoveDADataset(args.data_root, split="Train",
-                                 resolution=args.resolution)
+                                 resolution=args.resolution, augment=True)
         val_ds   = LoveDADataset(args.data_root, split="Val",
-                                 resolution=args.resolution)
+                                 resolution=args.resolution, augment=False)
         num_classes  = LoveDADataset.NUM_CLASSES
         class_names  = LoveDADataset.CLASS_NAMES
     elif args.dataset == "isaid":
