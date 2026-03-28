@@ -156,7 +156,11 @@ class LoveDADataset(Dataset):
             mask.resize((self.resolution, self.resolution), Image.NEAREST),
             dtype=np.int64
         )
-        mask_np = np.clip(mask_np, 0, self.NUM_CLASSES - 1)
+        # LoveDA 공식 포맷: 0=nodata, 1=background, ..., 7=agricultural
+        # mmseg reduce_zero_label 동일 처리: 0→255(ignore), 1~7→0~6
+        nodata = (mask_np == 0)
+        mask_np = mask_np - 1
+        mask_np[nodata] = 255
         return img_t, torch.from_numpy(mask_np)
 
 
