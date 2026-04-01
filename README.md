@@ -267,7 +267,7 @@ The CE+Dice loss optimizes pixel classification via the FPN path, but OVSS infer
 | Weight Decay | 1e-4 | 1e-4 |
 | Scheduler | CosineAnnealingLR | CosineAnnealingLR |
 | Epochs | 20 | 20 |
-| Batch Size | 2 | 4 |
+| Batch Size | 4 | 4 |
 | Mixed Precision | bfloat16 | bfloat16 |
 | Seed | 42 | 42 |
 | Resolution | 1008×1008 | 1008×1008 |
