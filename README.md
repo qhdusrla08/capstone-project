@@ -11,10 +11,11 @@ This project extends SegEarth-OV-3, a state-of-the-art Open-Vocabulary Semantic 
 
 **Core contributions of this project:**
 
-1. **RSAdapter + RSMultiscaleFPN** — Lightweight PEFT modules that inject remote sensing domain knowledge into SAM3's frozen ViT encoder and extract multi-scale features for small-object segmentation
-2. **Category-Adaptive Dual-Head Fusion** — Replaces SegEarth-OV-3's fixed MAX fusion (Eq. 2) with category-aware adaptive weighting between the instance and semantic heads
-3. **X-AnyLabeling Integration** — Wraps the full model stack (SAM3 + Adapter + FPN + Fusion) into an interactive GUI annotation tool
-4. **Concept Bank** *(planned)* — A structured visual-semantic concept bank for improved open-vocabulary generalization to unseen RS categories
+1. **RSAdapter + RSMultiscaleFPN** — Lightweight PEFT modules that inject remote sensing domain knowledge into SAM3's frozen ViT encoder and extract multi-scale features
+2. **Feature Distillation Training** — Adds a Block 31 cosine distillation loss to preserve SAM3's visual-language alignment during domain adaptation, enabling OVSS performance to exceed the original baseline
+3. **Category-Adaptive Dual-Head Fusion** — Replaces SegEarth-OV-3's fixed MAX fusion (Eq. 2) with category-aware adaptive weighting between the instance and semantic heads
+4. **X-AnyLabeling Integration** — Wraps the full model stack into an interactive GUI annotation tool
+5. **Concept Bank** *(planned)* — A structured visual-semantic concept bank for improved open-vocabulary generalization to unseen RS categories
 
 ---
 
@@ -24,18 +25,18 @@ This project extends SegEarth-OV-3, a state-of-the-art Open-Vocabulary Semantic 
 capstone/
 ├── SegEarth-OV-3/
 │   ├── rs_adapter/
-│   │   ├── rs_adapter.py          # RSAdapter + RSMultiscaleFPN class definitions
-│   │   └── train_adapter.py       # PEFT training script (LoveDA / iSAID)
-│   ├── sam3/                      # SAM3 model core
-│   ├── weights/sam3/sam3.pt       # Pre-trained SAM3 weights (3.3 GB, not tracked)
-│   ├── segearthov3_segmentor.py   # Original SegEarth-OV-3 OVSS evaluator
-│   └── test_fusion_modes.py       # Fusion mode validation script
+│   │   ├── rs_adapter.py              # RSAdapter + RSMultiscaleFPN class definitions
+│   │   ├── train_adapter.py           # Phase 1: closed-set PEFT training (CE + Dice)
+│   │   └── train_adapter_distill.py   # Phase 6: distillation PEFT training (CE + Dice + Distill)
+│   ├── eval_with_adapter.py           # OVSS evaluation with pre-trained adapter
+│   ├── configs/cfg_loveda.py          # LoveDA eval config (7 classes, text prompts)
+│   └── segearthov3_segmentor.py       # Original SegEarth-OV-3 OVSS segmentor
 └── X-AnyLabeling/
     └── anylabeling/
         ├── services/auto_labeling/
-        │   └── segearthov3.py     # SegEarth-OV-3 wrapper (Model subclass)
+        │   └── segearthov3.py         # SegEarth-OV-3 wrapper (Model subclass)
         └── configs/auto_labeling/
-            └── segearthov3.yaml   # Model config (classes, thresholds, modes)
+            └── segearthov3.yaml       # Model config (classes, thresholds, modes)
 ```
 
 ---
@@ -44,189 +45,282 @@ capstone/
 
 ### Full Pipeline
 
-![Adapter + FPN Architecture](revised%20Architecture.png)
-
-> **Multi-scale Adapter with FPN Fusion:** Lightweight bottleneck adapters (~0.5% of SAM3's 840M parameters) are inserted into all 32 ViT blocks via forward hooks. Intermediate features from global-attention checkpoints (Blocks 7, 15, 23, 31) are aggregated through an FPN-style top-down pathway to produce a four-level feature pyramid (P2–P5), injecting RS domain knowledge while preserving pretrained representations.
-
 ```
-Input Image
+Input Image (1008×1008)
     │
     ▼
-SAM3 ViT Encoder (frozen, 840M params)
-    │   ┌─────────────────────────────────┐
-    │   │  RSAdapter ×32 (~4.2M, trained) │  ← PEFT: RS domain knowledge injection
-    │   │  (bottleneck: Linear 1024→64→1024, scale=0 init)
-    │   └─────────────────────────────────┘
+SAM3 ViT Encoder (frozen, 840M params, depth=32, embed_dim=1024, patch_size=14)
+    │   ┌──────────────────────────────────────────────────────┐
+    │   │  RSAdapter ×32 (~4.2M, trained)                      │  ← PEFT: RS domain adaptation
+    │   │  Bottleneck: Linear 1024→64 → GELU → Linear 64→1024  │
+    │   │  + residual × scale  (scale initialized to 0)        │
+    │   └──────────────────────────────────────────────────────┘
+    │   Hook returns adapted output; all 32 subsequent blocks see adapted features
     │
-    ├─── Block 7  output (f7)  ─────────────┐
-    ├─── Block 15 output (f15) ─────────────┤
-    ├─── Block 23 output (f23) ─────────────┤  RSMultiscaleFPN (~3.4M, trained)
-    └─── Block 31 output (f31) ─────────────┘
+    ├─── Block 7  output (global attention) ─────────────────────┐
+    ├─── Block 15 output (global attention) ─────────────────────┤  RSMultiscaleFPN
+    ├─── Block 23 output (global attention) ─────────────────────┤  (~3.4M, trained)
+    └─── Block 31 output (global attention) ─────────────────────┘
                 │
                 ▼
-        ┌───────────────────┐
-        │  FPN Feature Pyramid        │
-        │  p2: 288×288 (×4 up)  ← small objects
-        │  p3: 144×144 (×2 up)  ← medium objects
-        │  p4:  72×72  (native) ← large objects
-        │  p5:  36×36  (pool)   ← global context
-        └───────────────────┘
+        ┌──────────────────────────────────┐
+        │ FPN Feature Pyramid              │
+        │  p2: 288×288 (×4 bilinear up)   ← small objects
+        │  p3: 144×144 (×2 bilinear up)   ← medium objects
+        │  p4:  72×72  (native)            ← large objects
+        │  p5:  36×36  (maxpool ÷2)       ← global context
+        │  Top-down fusion: p5→p4→p3→p2 (3×3 Conv)
+        └──────────────────────────────────┘
                 │
-    ┌───────────┴───────────────────────────────┐
-    │ Closed-set (PEFT training)                │  Open-Vocabulary (OVSS inference)
-    │ 1×1 Conv Head → logits                   │  SAM3 language_backbone + cross-modal decoder
-    │                                           │  → Dual-Head → Category-Adaptive Fusion
-    └───────────────────────────────────────────┘
+    ┌───────────┴──────────────────────────────────────────────┐
+    │ Closed-set training path                                 │  OVSS inference path
+    │ FPN p4 → 1×1 Conv Head                                   │  Block 31 adapted →
+    │ Loss: CE + 0.5×Dice (+ β×Distill in Phase 6)            │  SAM3 Neck → cross-modal decoder
+    │                                                          │  → Dual-Head → Category-Adaptive Fusion
+    └──────────────────────────────────────────────────────────┘
                 │
                 ▼
         Segmentation Map → Polygon Annotations (X-AnyLabeling)
 ```
 
+> **OVSS inference path**: The FPN and 1×1 Conv Head are **not used** during OVSS evaluation. Only the RSAdapter hooks (modifying Block 31 output) affect the SAM3 Neck → cross-modal decoder pipeline.
+
 ### RSAdapter
 
-A lightweight bottleneck adapter inserted at every ViT transformer block output.
+Lightweight bottleneck adapter inserted at every ViT block output via `register_forward_hook`.
 
 ```
-x → Linear(1024→64) → GELU → Linear(64→1024) → × scale → + x
+x (B, H, W, 1024) → flatten → Linear(1024→64) → GELU → Linear(64→1024) → × scale → + x
 ```
 
-- `scale` initialized to `0`: identity at start, enabling stable PEFT training
+- `scale` initialized to `0`: identity transform at init, prevents disrupting pretrained features
 - `adapted.to(x.dtype)`: handles bfloat16/float32 mixed precision
 - **Parameters**: ~131K per block × 32 blocks = **~4.2M total** (~0.5% of SAM3)
 
 ### RSMultiscaleFPN
 
-Fuses intermediate ViT block outputs (f7, f15, f23, f31) via an FPN-style pyramid.
+Fuses intermediate ViT global-attention block outputs (Blocks 7/15/23/31) via an FPN-style pyramid.
+All four inputs are 72×72×1024 (global attention blocks output full-resolution in SAM3's ViT-Det).
 
 ```
-f7  (72×72×1024) → Lateral Conv 1×1 → ×4 upsample → 288×288  [p2: fine detail]
-f15 (72×72×1024) → Lateral Conv 1×1 → ×2 upsample → 144×144  [p3: medium]
-f23 (72×72×1024) → Lateral Conv 1×1 →   identity  →  72×72   [p4: coarse]
-f31 (72×72×1024) → Lateral Conv 1×1 → maxpool ÷2  →  36×36   [p5: global]
+f7  (72×72×1024) → Lateral Conv 1×1 (1024→256) → ×4 bilinear → 288×288  [p2: fine detail]
+f15 (72×72×1024) → Lateral Conv 1×1 (1024→256) → ×2 bilinear → 144×144  [p3: medium]
+f23 (72×72×1024) → Lateral Conv 1×1 (1024→256) →  identity   →  72×72   [p4: coarse]
+f31 (72×72×1024) → Lateral Conv 1×1 (1024→256) → maxpool ÷2  →  36×36   [p5: global]
 
-Top-down FPN fusion (3×3 Conv):
+Top-down FPN fusion (3×3 Conv at each level):
   p5 → upsample → + p4 → upsample → + p3 → upsample → + p2
 ```
 
 - **Parameters**: Lateral ×4 (~1.0M) + FPN Conv ×4 (~2.4M) = **~3.4M total**
 
+### Feature Distillation (Phase 6)
+
+Adds a cosine distillation constraint at Block 31 to prevent feature drift from degrading OVSS.
+
+```
+L_total = L_CE + 0.5 × L_Dice + β × L_distill
+
+L_distill = 1 − cosine_sim(adapter(block_31_out), block_31_out.detach())
+```
+
+- **β = 0.1** (default): balances RS domain adaptation against SAM3 VL alignment preservation
+- Hook stores `(adapted, original.detach())` pair for distillation while also writing `hook_feats` for the FPN path
+- Target: Block 31 only (`--distill_blocks last`) — direct input to SAM3's Neck and cross-modal decoder
+
 ### Category-Adaptive Dual-Head Fusion
 
-Replaces the fixed element-wise MAX fusion in SegEarth-OV-3 (Eq. 2) with per-category adaptive weighting.
+Replaces the fixed element-wise MAX fusion in SegEarth-OV-3 with per-category adaptive weighting.
 
 **Baseline (MAX, original paper):**
 ```
 P_fused(h,w) = max(P_sem(h,w), P_inst_agg(h,w))
 ```
 
-**Heuristic fusion (Phase 1, implemented):**
+**Heuristic fusion (implemented):**
 ```
-P_fused^c(h,w) = α_c × P_inst_agg^c(h,w) + (1 - α_c) × P_sem^c(h,w)
+P_fused^c(h,w) = α_c × P_inst_agg^c(h,w) + (1 − α_c) × P_sem^c(h,w)
 
 α_c = 0.8  if c ∈ THINGS  (building, car, ship, …)
 α_c = 0.2  if c ∈ STUFF   (road, water, farmland, …)
 ```
 
-**Entropy-based dynamic fusion (Phase 2, implemented):**
+**Entropy-based dynamic fusion (implemented):**
 ```
-H_inst = entropy(P_inst_agg_c)    # instance head uncertainty
-H_sem  = entropy(P_sem_c)         # semantic head uncertainty
-
-α_c(h,w) = H_sem / (H_inst + H_sem)   # higher weight to more confident head
+H_inst = entropy(P_inst_agg_c)
+H_sem  = entropy(P_sem_c)
+α_c(h,w) = H_sem / (H_inst + H_sem)   # higher weight to the more confident head
 ```
 
-Motivation: SegEarth-OV-3's own Table 3 shows that "things" categories (buildings, vehicles) benefit more from the instance head while "stuff" categories (roads, water) benefit more from the semantic head — a distinction that MAX fusion ignores.
+Motivation: SegEarth-OV-3's own Table 3 shows "things" (buildings, vehicles) benefit more from the instance head while "stuff" (roads, water) benefit more from the semantic head — a distinction MAX fusion ignores.
 
 ---
 
-## Implemented Novelties
+## Experiment Results
 
-| # | Contribution | Status | Location |
-|---|---|---|---|
-| 1 | RSAdapter (PEFT domain adaptation) | ✅ Done | `rs_adapter/rs_adapter.py` |
-| 2 | RSMultiscaleFPN (multi-scale features) | ✅ Done | `rs_adapter/rs_adapter.py` |
-| 3 | PEFT training pipeline (LoveDA / iSAID) | ✅ Done | `rs_adapter/train_adapter.py` |
-| 4 | Category-Adaptive Fusion (heuristic) | ✅ Done | `segearthov3.py` L308–387 |
-| 5 | Category-Adaptive Fusion (entropy-based) | ✅ Done | `segearthov3.py` L308–387 |
-| 6 | X-AnyLabeling integration | ✅ Done | `segearthov3.py` |
-| 7 | Concept Bank for OVSS generalization | 🔧 Planned | — |
+### Dataset: LoveDA (Zenodo Official)
 
----
+| Split | Urban | Rural | Total |
+|-------|------:|------:|------:|
+| Train | 1,156 | 1,366 | **2,522** |
+| Val   |   765 |   904 | **1,669** |
 
-## Planned: Concept Bank
-
-> **Status: Future Implementation**
-
-SegEarth-OV-3 relies on manually curated text prompts (e.g., `"tree,forest"`, `"water,river"`) with no systematic exploration of prompt design. The planned **Concept Bank** addresses this limitation by building a structured repository of visual-semantic concepts for RS categories.
-
-**Planned scope:**
-- A hierarchical concept bank mapping coarse RS categories → fine-grained sub-concepts (e.g., `building` → `residential / commercial / industrial`)
-- Automatic synonym expansion using domain-specific ontologies (WordNet, GeoNames)
-- Concept-level presence scoring: for each patch, rank sub-concepts by SAM3 presence score and select the most relevant prompt automatically
-- Ensemble of concept-level predictions for improved zero-shot robustness
-
-This component will extend the OVSS inference pipeline end-to-end without requiring additional training, positioning it as a training-free complement to the RSAdapter PEFT approach.
+Classes (7): `background` / `building` / `road` / `water` / `barren` / `forest` / `agricultural`
 
 ---
 
-## Experiment Plan & Results
+### Phase 1 — Closed-set Baseline (CE + Dice)
 
-### Phase 1 — Closed-set Ablation (LoveDA, 20 epochs)
+**Script**: `rs_adapter/train_adapter.py` | **Checkpoint**: `rs_adapter/ckpt_full_best.pt`
 
-Evaluates visual feature quality of SAM3 + Adapter + FPN via supervised segmentation on LoveDA (7 classes).
+| Setting | Val mIoU |
+|---------|:--------:|
+| **Adapter + FPN (best)** | **0.5521** |
 
-**Ablation configuration:**
+> Baseline / FPN-only / Adapter-only ablation not yet re-run on the Zenodo dataset.
 
-| Exp | Adapter | FPN | Flags | Trainable Params |
-|-----|:-------:|:---:|-------|-----------------|
-| Baseline | ✗ | ✗ | `--no_adapter --no_fpn` | Head (~0.002M) |
-| +FPN only | ✗ | ✓ | `--no_adapter` | FPN + Head (~3.4M) |
-| +Adapter only | ✓ | ✗ | `--no_fpn` | Adapter + Head (~4.2M) |
-| +FPN+Adapter | ✓ | ✓ | (default) | Adapter + FPN + Head (~7.6M) |
-
-**Results (Val mIoU):**
-
-| | With Adapter | Without Adapter (`--no_adapter`) |
-|---|:---:|:---:|
-| FPN | **0.6384** | 0.6162 |
-| No FPN (`--no_fpn`) | 0.6324 | 0.4905 |
-
-**Summary:**
-
-| Exp | Adapter | FPN | Params | Val mIoU |
-|-----|:-------:|:---:|-------:|:--------:|
-| Baseline | ✗ | ✗ | ~0.002M | 0.4905 |
-| +FPN only | ✗ | ✓ | ~3.4M | 0.6162 |
-| +Adapter only | ✓ | ✗ | ~4.2M | 0.6324 |
-| **+FPN+Adapter** | ✓ | ✓ | **~7.6M** | **0.6384** |
-
-> FPN contributes the largest single gain (+0.126 mIoU over Baseline). RSAdapter adds an additional +0.022 on top of FPN. Without FPN, the adapter alone still improves significantly over Baseline (+0.142).
-
-**Class-wise Val IoU — +FPN+Adapter best checkpoint (Epoch 7):**
+**Per-class IoU (Adapter + FPN, best checkpoint):**
 
 | Background | Building | Road | Water | Barren | Forest | Agricultural |
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 0.9940 | 0.5171 | 0.6669 | 0.5222 | 0.7277 | 0.4108 | 0.6304 |
+| 0.5462 | 0.6806 | 0.5879 | 0.7077 | 0.3248 | 0.4409 | 0.5765 |
 
-> Forest IoU (0.411) remains the lowest, likely due to spectral confusion with Agricultural. Best checkpoint was reached at Epoch 7/20, suggesting early convergence.
+---
 
-### Phase 2 — OVSS Baseline (planned)
+### Phase 2 — OVSS Baseline (original SegEarth-OV-3, no adapter)
 
-Run original SegEarth-OV-3 (no adapter, text-prompt based) on LoveDA val split.
-Provides ① baseline mIoU for OVSS comparison.
+**Script**: `eval.py configs/cfg_loveda.py`
 
-### Phase 3 — OVSS + Adapter (planned)
+| mIoU | aAcc | mAcc |
+|:----:|:----:|:----:|
+| **47.38** | 63.80 | 62.01 |
 
-Load Phase 1 adapter weights, plug into OVSS inference (text prompt + max/argmax).
-Measures whether RS domain adaptation generalizes to the open-vocabulary setting.
+**Per-class IoU:**
 
-### Phase 4 — Full Ablation: Fusion × Adapter (planned)
+| Background | Building | Road | Water | Barren | Forest | Agricultural |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 45.53 | 63.80 | 53.87 | 51.40 | 35.79 | 33.81 | 47.46 |
 
-| | `adapter: off` | `adapter: full` |
-|---|---|---|
-| `fusion: max` | ① Baseline | ② + Adapter |
-| `fusion: heuristic` | ③ + Heuristic Fusion | ④ + Adapter + Heuristic |
-| `fusion: entropy` | ⑤ + Entropy Fusion | ⑥ + Adapter + Entropy ← **Final** |
+> Barren (35.79) and Forest (33.81) are the weakest classes — SAM3's VL alignment has a larger text-visual gap for these vegetation-related categories.
+
+---
+
+### Phase 3 — OVSS + CE+Dice Adapter (Proxy Task Gap confirmed)
+
+**Script**: `eval_with_adapter.py configs/cfg_loveda.py --adapter_ckpt rs_adapter/ckpt_full_best.pt`
+
+| mIoU | vs Phase 2 |
+|:----:|:----------:|
+| **45.12** | **−2.26** |
+
+**Per-class IoU (Δ vs Phase 2):**
+
+| Background | Building | Road | Water | Barren | Forest | Agricultural |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 41.28 (−4.25) | **65.06 (+1.26)** | 53.52 (−0.35) | 49.54 (−1.86) | 28.82 (**−6.97**) | 28.60 (**−5.21**) | **49.00 (+1.54)** |
+
+**Root cause — Proxy Task Gap:**
+
+The CE+Dice loss optimizes pixel classification via the FPN path, but OVSS inference uses `Block 31 adapted → SAM3 Neck → cross-modal decoder` — a path the training loss never touched. The Adapter shifts Block 31 features toward FPN-classification-optimal representations, which disrupts the visual-text feature alignment the cross-modal decoder expects. Barren and Forest — already the weakest classes in Phase 2 — suffer the largest additional drops (−6.97, −5.21).
+
+---
+
+### Phase 6 — OVSS + Feature Distillation (Block 31)
+
+**Script**: `rs_adapter/train_adapter_distill.py` → `eval_with_adapter.py configs/cfg_loveda.py --adapter_ckpt rs_adapter/ckpt_distill_best.pt`
+**Checkpoint**: `rs_adapter/ckpt_distill_best.pt`
+
+| Metric | Phase 2 (baseline) | Phase 6 (Distill, β=0.1) | Δ |
+|--------|:-----------------:|:------------------------:|:---:|
+| **OVSS mIoU** | 47.38 | **50.31** | **+2.94** |
+| aAcc | 63.80 | 64.91 | +1.11 |
+| mAcc | 62.01 | 66.72 | +4.72 |
+| Closed-set val mIoU | — | 0.5490 | (Phase 1: 0.5521) |
+
+**Per-class IoU (Δ vs Phase 2):**
+
+| Background | Building | Road | Water | Barren | Forest | Agricultural |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 41.38 (−4.15) | **65.95 (+2.16)** | **55.68 (+1.80)** | **68.91 (+17.51)** | **40.23 (+4.48)** | 30.49 (−3.32) | **49.49 (+2.03)** |
+
+5 of 7 classes exceed the Phase 2 baseline. Forest remains below baseline (30.49 vs 33.81); Background also declines (−4.15).
+
+**Full Ablation Table (OVSS, Zenodo dataset):**
+
+| Phase | Adapter | Loss | OVSS mIoU | barren IoU | forest IoU |
+|-------|:-------:|------|:---------:|:----------:|:----------:|
+| 2 (baseline) | ✗ | — | 47.38 | 35.79 | 33.81 |
+| 3 | ✓ | CE + Dice | 45.12 | 28.82 | 28.60 |
+| **6** | **✓** | **CE + Dice + Distill (β=0.1)** | **50.31** | **40.23** | **30.49** |
+| (8) β sweep | ✓ | CE + Dice + Distill | ? | ? | ? |
+
+---
+
+## Training
+
+### Common Hyperparameters
+
+| Hyperparameter | Phase 1 | Phase 6 |
+|---------------|:-------:|:-------:|
+| Optimizer | AdamW | AdamW |
+| Learning Rate | 1e-3 | 1e-3 |
+| Weight Decay | 1e-4 | 1e-4 |
+| Scheduler | CosineAnnealingLR | CosineAnnealingLR |
+| Epochs | 20 | 20 |
+| Batch Size | 2 | 4 |
+| Mixed Precision | bfloat16 | bfloat16 |
+| Seed | 42 | 42 |
+| Resolution | 1008×1008 | 1008×1008 |
+
+### Phase 1 — Closed-set (CE + Dice)
+
+```bash
+cd ~/capstone/SegEarth-OV-3
+python rs_adapter/train_adapter.py \
+    --segearthov3_path ~/capstone/SegEarth-OV-3 \
+    --model_path       weights/sam3/sam3.pt \
+    --data_root        ~/datasets/LoveDA_Final \
+    --dataset          loveda \
+    --bottleneck       64 \
+    --lr               1e-3 \
+    --epochs           20 \
+    --batch_size       2 \
+    --save_path        rs_adapter/ckpt_full.pt \
+    --log_dir          runs/adapter
+```
+
+Ablation flags: `--no_adapter` (disable RSAdapter), `--no_fpn` (disable FPN)
+
+### Phase 6 — Feature Distillation (CE + Dice + Distill)
+
+```bash
+cd ~/capstone/SegEarth-OV-3
+python rs_adapter/train_adapter_distill.py \
+    --segearthov3_path ~/capstone/SegEarth-OV-3 \
+    --model_path       weights/sam3/sam3.pt \
+    --data_root        ~/datasets/LoveDA_Final \
+    --dataset          loveda \
+    --distill_weight   0.1 \
+    --distill_blocks   last \
+    --epochs           20 \
+    --batch_size       4 \
+    --save_path        rs_adapter/ckpt_distill.pt \
+    --log_dir          runs/adapter_distill
+```
+
+### OVSS Evaluation
+
+```bash
+cd ~/capstone/SegEarth-OV-3
+
+# Phase 3: CE+Dice adapter
+python eval_with_adapter.py configs/cfg_loveda.py \
+    --adapter_ckpt rs_adapter/ckpt_full_best.pt
+
+# Phase 6: Distillation adapter
+python eval_with_adapter.py configs/cfg_loveda.py \
+    --adapter_ckpt rs_adapter/ckpt_distill_best.pt
+```
 
 ---
 
@@ -236,104 +330,31 @@ Measures whether RS domain adaptation generalizes to the open-vocabulary setting
 
 - Python 3.10+
 - PyTorch 2.3+ with CUDA 12.1 (cu121 build)
-- NVIDIA GPU with 16 GB+ VRAM (80 GB A100 recommended for training)
+- NVIDIA GPU with 16 GB+ VRAM (trained on NVIDIA A100-SXM4-80GB)
 
-### Environment
+### Dataset (LoveDA, Zenodo)
 
-```bash
-# Recommended: use the provided conda environment file
-conda env create \
-    --name segearth_stable \
-    --file SegEarth-OV-3/env/environment.segearth_stable.yml
-conda activate segearth_stable
-```
-
-Or manually:
-
-```bash
-conda create -n segearth python=3.10 -y
-conda activate segearth
-pip install torch==2.3.0 torchvision==0.18.0 --index-url https://download.pytorch.org/whl/cu121
-pip install timm einops transformers pillow opencv-python scipy tqdm tensorboard
-pip install -e SegEarth-OV-3/
-```
-
-### Weights
-
-Place SAM3 weights at:
-```
-SegEarth-OV-3/weights/sam3/sam3.pt   # 3.3 GB
-```
-
-### Dataset (LoveDA)
-
-Downloaded from HuggingFace. Urban and Rural scenes are mixed within each split.
+Download from the [Zenodo official release](https://zenodo.org/record/5706578).
 
 ```
-datasets/LoveDA/
-├── .cache/
-├── urban:rural train images/   # RGB .png (1024×1024), urban + rural mixed
-├── urban:rural train masks/    # Label .png (0–6), urban + rural mixed
-├── urban:rural val images/     # RGB .png (1024×1024), urban + rural mixed
-└── urban:rural val masks/      # Label .png (0–6), urban + rural mixed
+datasets/LoveDA_Final/
+├── train/
+│   ├── Urban/
+│   │   ├── images_png/   # RGB .png (1024×1024), 1,156장
+│   │   └── masks_png/    # Label .png (1–7, 0=no-data ignored)
+│   └── Rural/
+│       ├── images_png/   # 1,366장
+│       └── masks_png/
+└── validation/
+    ├── Urban/
+    │   ├── images_png/   # 765장
+    │   └── masks_png/
+    └── Rural/
+        ├── images_png/   # 904장
+        └── masks_png/
 ```
 
----
-
-## Training (PEFT)
-
-### Basic run
-
-```bash
-cd SegEarth-OV-3/rs_adapter
-python train_adapter.py \
-    --segearthov3_path ~/capstone/SegEarth-OV-3 \
-    --model_path       ~/capstone/SegEarth-OV-3/weights/sam3/sam3.pt \
-    --data_root        ~/datasets/LoveDA \
-    --dataset          loveda \
-    --bottleneck       64 \
-    --lr               1e-3 \
-    --epochs           20 \
-    --batch_size       4 \
-    --seed             42 \
-    --save_path        rs_adapter/adapter_ckpt.pt \
-    --log_dir          rs_adapter/runs/adapter
-```
-
-### Ablation flags
-
-```bash
-# Baseline (no adapter, no FPN)
-python train_adapter.py ... --no_adapter --no_fpn
-
-# FPN only
-python train_adapter.py ... --no_adapter
-
-# Adapter only (no FPN)
-python train_adapter.py ... --no_fpn
-
-# Full (default): FPN + Adapter
-python train_adapter.py ...
-```
-
-### Resume
-
-```bash
-python train_adapter.py ... --resume rs_adapter/adapter_ckpt.pt
-```
-
-### Monitor
-
-```bash
-tensorboard --logdir rs_adapter/runs --port 6006
-```
-
-### VRAM budget
-
-| Config | Estimated VRAM |
-|--------|---------------|
-| batch=2, 1008² | ~18 GB |
-| batch=4, 1008² | ~28–30 GB |
+Label mapping: `1=background, 2=building, 3=road, 4=water, 5=barren, 6=forest, 7=agricultural`
 
 ---
 
@@ -354,11 +375,11 @@ classes:
 prob_thd: 0.3            # Final pixel-level filter (also controlled via UI slider)
 fusion_mode: "entropy"   # "max" | "heuristic" | "entropy"
 adapter_mode: "full"     # "off" | "full"
-adapter_path: "/path/to/adapter_ckpt.pt"
+adapter_path: "/path/to/ckpt_distill_best.pt"
 adapter_bottleneck: 64
 ```
 
-### Fusion modes
+### Fusion Modes
 
 | `fusion_mode` | Description |
 |---|---|
@@ -366,12 +387,30 @@ adapter_bottleneck: 64
 | `heuristic` | Fixed α per things/stuff category |
 | `entropy` | Dynamic pixel-wise α from prediction entropy |
 
-### Adapter modes
+### Adapter Modes
 
 | `adapter_mode` | Description |
 |---|---|
-| `off` | Original SegEarth-OV-3 (no adapter, no FPN) |
-| `full` | Load pre-trained RSAdapter + RSMultiscaleFPN |
+| `off` | Original SegEarth-OV-3 (no adapter) |
+| `full` | Load pre-trained RSAdapter + FPN weights |
+
+---
+
+## Planned: Concept Bank
+
+> **Status: Future Implementation**
+
+SegEarth-OV-3 relies on manually curated text prompts (e.g., `"tree,forest"`, `"water,river"`) with no systematic exploration of prompt design. The paper itself acknowledges: *"The prompt setting is manually curated based on dataset features and has not been systematically explored in this version."*
+
+The planned **Concept Bank** addresses this by building a structured repository of visual-semantic concepts for RS categories.
+
+**Planned scope:**
+
+- **Hierarchical prompt generation**: Map coarse RS categories → fine-grained sub-concepts (e.g., `building` → `residential / commercial / industrial`), then use SAM3 presence score to automatically select the most relevant sub-prompt per image
+- **Automatic synonym expansion**: Use domain-specific ontologies (WordNet, GeoNames) to auto-generate synonyms, ensemble predictions across synonym variants
+- **Concept-level presence scoring**: Per-patch presence score instead of global scalar to suppress false positives in multi-patch inference
+
+This component requires no additional training — it operates purely at inference time as a training-free complement to the RSAdapter PEFT approach.
 
 ---
 
@@ -379,34 +418,36 @@ adapter_bottleneck: 64
 
 | Decision | Reason |
 |---|---|
-| `sam3_model.backbone.forward_image()` called directly | `Sam3Processor.set_image()` has `@inference_mode()` decorator that blocks gradients |
-| `hook_feats` stored **without** `.detach()` | Gradient must flow back through FPN → Adapter |
-| `scale = zeros(1)` init in RSAdapter | Identity at start; avoids disrupting pretrained SAM3 features early in training |
-| `adapted.to(x.dtype)` | Prevents float32/bfloat16 mismatch in mixed precision training |
-| CrossEntropy + 0.5 × Soft Dice | CE handles class imbalance; Dice improves boundary IoU |
-| `--no_fpn` path uses SAM3 native `vision_features` (72×72) | Cleanly isolates Adapter-only contribution without multi-scale |
+| `sam3_model.backbone.forward_image()` called directly | `Sam3Processor.set_image()` has `@inference_mode()` — blocks gradients during training |
+| `hook_feats` stored without `.detach()` | Gradient must flow through FPN → Adapter during closed-set training |
+| OVSS eval hook: `return adapter(output)` only | FPN not in OVSS path; only Block 31 adapted output feeds SAM3 Neck |
+| `scale = zeros(1)` init in RSAdapter | Identity at start; prevents catastrophic forgetting early in PEFT |
+| `original.detach()` in distillation hook | Prevents gradient flowing into the frozen SAM3 teacher path |
+| Distillation target: Block 31 only | Direct input to SAM3 Neck — most causally linked to OVSS performance |
+| β = 0.1 for distillation weight | Empirically balances RS domain adaptation vs VL alignment preservation |
+| CE + 0.5 × Soft Dice | CE handles class imbalance; Dice improves boundary IoU |
 
 ---
 
 ## Roadmap
 
-- [x] RSAdapter + RSMultiscaleFPN implementation
-- [x] PEFT training pipeline (LoveDA, iSAID support)
+- [x] RSAdapter + RSMultiscaleFPN implementation (`rs_adapter/rs_adapter.py`)
+- [x] Phase 1 closed-set training (CE + Dice): Adapter+FPN best val mIoU **0.5521**
+- [x] Phase 2 OVSS baseline: mIoU **47.38**
+- [x] Phase 3 OVSS + CE+Dice Adapter: mIoU **45.12** (−2.26, Proxy Task Gap confirmed)
+- [x] Phase 6 Feature Distillation: OVSS mIoU **50.31** (+2.94 vs baseline)
 - [x] Category-Adaptive Fusion (heuristic + entropy)
 - [x] X-AnyLabeling integration
-- [x] Closed-set ablation: complete 4-way comparison (Baseline 0.4905 / +FPN 0.6162 / +Adapter 0.6324 / +FPN+Adapter 0.6384)
-- [ ] OVSS baseline evaluation on LoveDA
-- [ ] OVSS + Adapter: measure domain adaptation effect on zero-shot setting
-- [ ] Full ablation table: Fusion × Adapter × OVSS
-- [ ] Concept Bank: hierarchical prompt + synonym expansion
-- [ ] Concept Bank: local presence-guided filtering per sliding-window patch
+- [ ] Phase 1 Ablation re-run (Baseline / FPN-only / Adapter-only on Zenodo dataset)
+- [ ] Phase 8: β sweep ablation {0.01, 0.05, 0.1, 0.5}
+- [ ] Full ablation: Fusion × Adapter × OVSS
+- [ ] Concept Bank: hierarchical prompt + synonym expansion (inference-time, no retraining)
 
 ---
 
 ## References
 
-- SegEarth-OV-3: [earth-insights/SegEartg-OV-3](https://github.com/earth-insights/SegEarth-OV-3)
-- SAM3: [facebookresearch/sam3] (https://github.com/facebookresearch/sam3)
+- SegEarth-OV-3: [earth-insights/SegEarth-OV-3](https://github.com/earth-insights/SegEarth-OV-3)
 - X-AnyLabeling: [CVHub520/X-AnyLabeling](https://github.com/CVHub520/X-AnyLabeling)
-- LoveDA Dataset: [LoveDA: A Remote Sensing Land-Cover Dataset](https://github.com/Junjue-Wang/LoveDA)
-- iSAID Dataset: [iSAID: A Large-scale Dataset for Instance Segmentation](https://captain-whu.github.io/iSAID/)
+- LoveDA Dataset: [LoveDA Zenodo](https://zenodo.org/record/5706578) / [GitHub](https://github.com/Junjue-Wang/LoveDA)
+- SAM3: [facebookresearch/sam3](https://github.com/facebookresearch/sam3)
