@@ -87,6 +87,8 @@ SAM3 ViT Encoder (frozen, 840M params, depth=32, embed_dim=1024, patch_size=14)
 
 ### RSAdapter
 
+![Adapter Architecture](Adapter.png)
+
 Lightweight bottleneck adapter inserted at every ViT block output via `register_forward_hook`.
 
 ```
