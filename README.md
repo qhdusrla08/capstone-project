@@ -27,7 +27,7 @@ capstone/
 │   ├── rs_adapter/
 │   │   ├── rs_adapter.py              # RSAdapter + RSMultiscaleFPN class definitions
 │   │   ├── train_adapter.py           # Phase 1: closed-set PEFT training (CE + Dice)
-│   │   └── train_adapter_distill.py   # Phase 6: distillation PEFT training (CE + Dice + Distill)
+│   │   └── train_adapter_distill.py   # Phase 4: distillation PEFT training (CE + Dice + Distill)
 │   ├── eval_with_adapter.py           # OVSS evaluation with pre-trained adapter
 │   ├── configs/cfg_loveda.py          # LoveDA eval config (7 classes, text prompts)
 │   └── segearthov3_segmentor.py       # Original SegEarth-OV-3 OVSS segmentor
@@ -75,7 +75,7 @@ SAM3 ViT Encoder (frozen, 840M params, depth=32, embed_dim=1024, patch_size=14)
     ┌───────────┴──────────────────────────────────────────────┐
     │ Closed-set training path                                 │  OVSS inference path
     │ FPN p4 → 1×1 Conv Head                                   │  Block 31 adapted →
-    │ Loss: CE + 0.5×Dice (+ β×Distill in Phase 6)            │  SAM3 Neck → cross-modal decoder
+    │ Loss: CE + 0.5×Dice (+ β×Distill in Phase 4)            │  SAM3 Neck → cross-modal decoder
     │                                                          │  → Dual-Head → Category-Adaptive Fusion
     └──────────────────────────────────────────────────────────┘
                 │
@@ -114,7 +114,7 @@ Top-down FPN fusion (3×3 Conv at each level):
 
 - **Parameters**: Lateral ×4 (~1.0M) + FPN Conv ×4 (~2.4M) = **~3.4M total**
 
-### Feature Distillation (Phase 6)
+### Feature Distillation (Phase 4)
 
 Adds a cosine distillation constraint at Block 31 to prevent feature drift from degrading OVSS.
 
@@ -225,12 +225,12 @@ The CE+Dice loss optimizes pixel classification via the FPN path, but OVSS infer
 
 ---
 
-### Phase 6 — OVSS + Feature Distillation (Block 31)
+### Phase 4 — OVSS + Feature Distillation (Block 31)
 
 **Script**: `rs_adapter/train_adapter_distill.py` → `eval_with_adapter.py configs/cfg_loveda.py --adapter_ckpt rs_adapter/ckpt_distill_best.pt`
 **Checkpoint**: `rs_adapter/ckpt_distill_best.pt`
 
-| Metric | Phase 2 (baseline) | Phase 6 (Distill, β=0.1) | Δ |
+| Metric | Phase 2 (baseline) | Phase 4 (Distill, β=0.1) | Δ |
 |--------|:-----------------:|:------------------------:|:---:|
 | **OVSS mIoU** | 47.38 | **50.31** | **+2.94** |
 | aAcc | 63.80 | 64.91 | +1.11 |
@@ -251,8 +251,8 @@ The CE+Dice loss optimizes pixel classification via the FPN path, but OVSS infer
 |-------|:-------:|------|:---------:|:----------:|:----------:|
 | 2 (baseline) | ✗ | — | 47.38 | 35.79 | 33.81 |
 | 3 | ✓ | CE + Dice | 45.12 | 28.82 | 28.60 |
-| **6** | **✓** | **CE + Dice + Distill (β=0.1)** | **50.31** | **40.23** | **30.49** |
-| (8) β sweep | ✓ | CE + Dice + Distill | ? | ? | ? |
+| **4** | **✓** | **CE + Dice + Distill (β=0.1)** | **50.31** | **40.23** | **30.49** |
+| (5) β sweep | ✓ | CE + Dice + Distill | ? | ? | ? |
 
 ---
 
@@ -260,7 +260,7 @@ The CE+Dice loss optimizes pixel classification via the FPN path, but OVSS infer
 
 ### Common Hyperparameters
 
-| Hyperparameter | Phase 1 | Phase 6 |
+| Hyperparameter | Phase 1 | Phase 4 |
 |---------------|:-------:|:-------:|
 | Optimizer | AdamW | AdamW |
 | Learning Rate | 1e-3 | 1e-3 |
@@ -291,7 +291,7 @@ python rs_adapter/train_adapter.py \
 
 Ablation flags: `--no_adapter` (disable RSAdapter), `--no_fpn` (disable FPN)
 
-### Phase 6 — Feature Distillation (CE + Dice + Distill)
+### Phase 4 — Feature Distillation (CE + Dice + Distill)
 
 ```bash
 cd ~/capstone/SegEarth-OV-3
@@ -317,7 +317,7 @@ cd ~/capstone/SegEarth-OV-3
 python eval_with_adapter.py configs/cfg_loveda.py \
     --adapter_ckpt rs_adapter/ckpt_full_best.pt
 
-# Phase 6: Distillation adapter
+# Phase 4: Distillation adapter
 python eval_with_adapter.py configs/cfg_loveda.py \
     --adapter_ckpt rs_adapter/ckpt_distill_best.pt
 ```
@@ -435,11 +435,11 @@ This component requires no additional training — it operates purely at inferen
 - [x] Phase 1 closed-set training (CE + Dice): Adapter+FPN best val mIoU **0.5521**
 - [x] Phase 2 OVSS baseline: mIoU **47.38**
 - [x] Phase 3 OVSS + CE+Dice Adapter: mIoU **45.12** (−2.26, Proxy Task Gap confirmed)
-- [x] Phase 6 Feature Distillation: OVSS mIoU **50.31** (+2.94 vs baseline)
+- [x] Phase 4 Feature Distillation: OVSS mIoU **50.31** (+2.94 vs baseline)
 - [x] Category-Adaptive Fusion (heuristic + entropy)
 - [x] X-AnyLabeling integration
 - [ ] Phase 1 Ablation re-run (Baseline / FPN-only / Adapter-only on Zenodo dataset)
-- [ ] Phase 8: β sweep ablation {0.01, 0.05, 0.1, 0.5}
+- [ ] Phase 5: β sweep ablation {0.01, 0.05, 0.1, 0.5}
 - [ ] Full ablation: Fusion × Adapter × OVSS
 - [ ] Concept Bank: hierarchical prompt + synonym expansion (inference-time, no retraining)
 
