@@ -478,7 +478,7 @@ for epoch in range(start_epoch, args.epochs):
                     fpn_out["p4"],  # (B, 256, 72,  72)
                     fpn_out["p5"],  # (B, 256, 36,  36)
                 ]
-                vis_feat = fpn_out["p4"].float()
+                vis_feat = fpn_out["p2"].float()
 
             # 분류 헤드: 업샘플 → 픽셀 분류
             vis_up = F.interpolate(
@@ -531,7 +531,7 @@ for epoch in range(start_epoch, args.epochs):
                     vis_feat = backbone_out["vision_features"].float()
                 else:
                     fpn_out  = fpn(hook_feats)
-                    vis_feat = fpn_out["p4"].float()
+                    vis_feat = fpn_out["p2"].float()
                 vis_up = F.interpolate(
                     vis_feat,
                     size=(args.resolution, args.resolution),
