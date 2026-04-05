@@ -504,12 +504,12 @@ for epoch in range(start_epoch, args.epochs):
             backbone_out = sam3_model.backbone.forward_image(images)
 
             fpn_out  = fpn(hook_feats)
-            backbone_out["vision_features"] = fpn_out["p4"]
+            backbone_out["vision_features"] = fpn_out["p4"] # dead code
             backbone_out["backbone_fpn"] = [
                 fpn_out["p2"], fpn_out["p3"], fpn_out["p4"], fpn_out["p5"],
             ]
 
-            vis_feat = fpn_out["p2"].float()  # (B, 256, 288, 288)
+            vis_feat = fpn_out["p4"].float()  # (B, 256, 288, 288)
             vis_up   = F.interpolate(
                 vis_feat,
                 size=(args.resolution, args.resolution),
