@@ -10,3 +10,4 @@ run.sh
 show_dir
 weights
 figs
+infer_loveda_test.pyenv/environment.segearth_stable.yml
