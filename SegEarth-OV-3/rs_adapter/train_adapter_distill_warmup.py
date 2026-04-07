@@ -632,7 +632,7 @@ for epoch in range(start_epoch, args.epochs):
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
                 backbone_out = sam3_model.backbone.forward_image(images)
                 fpn_out  = fpn(hook_feats)
-                vis_feat = fpn_out["p2"].float()
+                vis_feat = fpn_out["p4"].float()
                 vis_up   = F.interpolate(
                     vis_feat,
                     size=(args.resolution, args.resolution),
