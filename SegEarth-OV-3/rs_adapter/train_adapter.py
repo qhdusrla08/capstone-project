@@ -74,6 +74,8 @@ parser.add_argument("--log_dir", default="./runs/adapter",
                     help="TensorBoard 로그 디렉토리")
 parser.add_argument("--seed", type=int, default=42,
                     help="재현성을 위한 글로벌 랜덤 시드")
+parser.add_argument("--label_smoothing", type=float, default=0.1,
+                    help="CE loss label smoothing factor (Müller et al., NeurIPS 2019)")
 args = parser.parse_args()
 
 # ── 시드 고정 ────────────────────────────────────────────────────────────────
@@ -427,12 +429,26 @@ for blk_idx in range(len(vit_blocks)):
     hooks.append(hook)
 
 # ── 옵티마이저 + 스케줄러 ─────────────────────────────────────────────────────
-optimizer = optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-4)
+optimizer = optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-2)
 scheduler = optim.lr_scheduler.CosineAnnealingLR(
     optimizer, T_max=args.epochs - start_epoch, eta_min=args.lr * 0.01
 )
 
-criterion_ce = nn.CrossEntropyLoss(ignore_index=255)
+# ── 클래스 가중치 (median frequency balancing) ────────────────────────────────
+# LoveDA: Wang et al. (NeurIPS 2021) 기반 근사 픽셀 빈도 → median / freq_c
+# iSAID: 통계 미확보 → uniform
+def get_class_weights(dataset_name: str, num_classes: int) -> torch.Tensor:
+    if dataset_name == "loveda":
+        freq = torch.tensor([0.27, 0.14, 0.11, 0.14, 0.03, 0.14, 0.17])
+        return freq.median() / freq
+    return torch.ones(num_classes)
+
+class_weights = get_class_weights(args.dataset, num_classes).to(device)
+criterion_ce = nn.CrossEntropyLoss(
+    weight=class_weights,
+    ignore_index=255,
+    label_smoothing=args.label_smoothing,
+)
 
 # ── TensorBoard ──────────────────────────────────────────────────────────────
 os.makedirs(args.log_dir, exist_ok=True)
