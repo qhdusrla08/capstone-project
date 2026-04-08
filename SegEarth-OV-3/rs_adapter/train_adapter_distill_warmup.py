@@ -88,6 +88,11 @@ parser.add_argument("--distill_blocks", type=str, default="last",
                          "  all         : block 0~31 전체 (가장 강한 제약)")
 parser.add_argument("--lr", type=float, default=1e-3,
                     help="학습률 (AdamW)")
+parser.add_argument("--lr_warmup_epochs", type=int, default=5,
+                    help="LR 선형 warmup 구간 (epoch 수, 0이면 비활성화).\n"
+                         "Goyal et al. (2017, arXiv:1706.02677): 랜덤 초기화 직후\n"
+                         "고LR은 gradient 폭발 유발 → 선형 warmup으로 완화.\n"
+                         "timm (Wightman et al.): ViT 계열 fine-tuning 표준 설정.")
 parser.add_argument("--epochs", type=int, default=20,
                     help="총 에포크 수")
 parser.add_argument("--batch_size", type=int, default=4,
@@ -114,6 +119,11 @@ if args.warmup_epochs + args.rampup_epochs > args.epochs:
         f"warmup_epochs({args.warmup_epochs}) + rampup_epochs({args.rampup_epochs}) "
         f"> epochs({args.epochs}). β_max에 도달하기 전에 학습이 종료됩니다. "
         f"epochs를 늘리거나 warmup/rampup을 줄여주세요."
+    )
+if args.lr_warmup_epochs >= args.epochs:
+    parser.error(
+        f"lr_warmup_epochs({args.lr_warmup_epochs}) >= epochs({args.epochs}). "
+        f"cosine decay 구간이 없습니다. lr_warmup_epochs를 줄여주세요."
     )
 
 # ── 시드 고정 ────────────────────────────────────────────────────────────────
@@ -435,6 +445,9 @@ print(f"  β_max = {args.distill_weight}  |  "
 print(f"  β=0 구간: epoch 1~{args.warmup_epochs}  |  "
       f"β 선형 증가: epoch {args.warmup_epochs+1}~{args.warmup_epochs+args.rampup_epochs}  |  "
       f"β={args.distill_weight} 고정: epoch {args.warmup_epochs+args.rampup_epochs+1}~{args.epochs}")
+print(f"  LR warmup: epoch 1~{args.lr_warmup_epochs} (0 → {args.lr:.0e})  |  "
+      f"cosine decay: epoch {args.lr_warmup_epochs+1}~{args.epochs} "
+      f"({args.lr:.0e} → {args.lr*0.01:.0e})")
 
 # ── Adapter + FPN + 분류 헤드 초기화 ─────────────────────────────────────────
 print("[3/4] Adapter + FPN + 분류 헤드 초기화 중...")
@@ -512,10 +525,51 @@ for blk_idx in range(len(vit_blocks)):
     )
 
 # ── 옵티마이저 + 스케줄러 ─────────────────────────────────────────────────────
-optimizer = optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-2)
-scheduler = optim.lr_scheduler.CosineAnnealingLR(
-    optimizer, T_max=args.epochs - start_epoch, eta_min=args.lr * 0.01
-)
+# 파라미터 그룹 분리:
+#   decay    : FPN/cls_head weight → weight_decay=1e-2
+#   no_decay : 모든 bias, RSAdapter scale → weight_decay=0
+# 근거 (domain-agnostic 관행):
+#   - bias 제외: GPT/GPT-2 구현 관행, ViT-Adapter (Chen et al., ICLR 2023) paramwise_cfg
+#   - scale 제외: scale=0 zero-init 트릭(LoRA, Hu et al., ICLR 2022)과 동일 설계 원칙.
+#     weight_decay가 0 방향으로 당기면 adapter 도메인 적응 학습과 충돌.
+# 실질 효과: 설계 일관성 보호 목적. overfitting 자체 억제 효과는 제한적.
+decay_params, no_decay_params = [], []
+for name, param in (
+    list(adapters.named_parameters())
+    + list(fpn.named_parameters())
+    + list(cls_head.named_parameters())
+):
+    if "scale" in name or "bias" in name:
+        no_decay_params.append(param)
+    else:
+        decay_params.append(param)
+
+optimizer = optim.AdamW([
+    {"params": decay_params,    "weight_decay": 1e-2},
+    {"params": no_decay_params, "weight_decay": 0.0},
+], lr=args.lr)
+# LR 스케줄: 선형 warmup → cosine decay
+# - LinearLR: start_factor=0.01 → lr * 0.01 에서 시작해 lr까지 선형 증가
+# - CosineAnnealingLR: lr → lr * 0.01 까지 cosine 감소
+# - SequentialLR: warmup 구간 종료 후 cosine으로 전환
+# 근거: Goyal et al. (2017), timm (Wightman et al.) ViT fine-tuning 표준
+_warmup = args.lr_warmup_epochs
+if _warmup > 0:
+    warmup_sched = optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.01, end_factor=1.0, total_iters=_warmup
+    )
+    cosine_sched = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(args.epochs - start_epoch - _warmup, 1),
+        eta_min=args.lr * 0.01,
+    )
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[_warmup]
+    )
+else:
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs - start_epoch, eta_min=args.lr * 0.01
+    )
 
 # ── 클래스 가중치 (median frequency balancing) ────────────────────────────────
 # LoveDA: Wang et al. (NeurIPS 2021) 기반 근사 픽셀 빈도 → median / freq_c
