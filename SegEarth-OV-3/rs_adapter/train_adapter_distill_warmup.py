@@ -107,6 +107,10 @@ parser.add_argument("--resume", default="",
                     help="이어 학습할 체크포인트 경로")
 parser.add_argument("--log_dir", default="./runs/adapter_distill_warmup",
                     help="TensorBoard 로그 디렉토리")
+parser.add_argument("--weight_decay", type=float, default=1e-2,
+                    help="AdamW weight decay (decay 파라미터 그룹에 적용, 기본 1e-2)")
+parser.add_argument("--no_class_weights", action="store_true",
+                    help="클래스 가중 CE 비활성화 (uniform 가중치 사용)")
 parser.add_argument("--seed", type=int, default=42,
                     help="재현성을 위한 글로벌 랜덤 시드")
 parser.add_argument("--label_smoothing", type=float, default=0.1,
@@ -545,7 +549,7 @@ for name, param in (
         decay_params.append(param)
 
 optimizer = optim.AdamW([
-    {"params": decay_params,    "weight_decay": 1e-2},
+    {"params": decay_params,    "weight_decay": args.weight_decay},
     {"params": no_decay_params, "weight_decay": 0.0},
 ], lr=args.lr)
 # LR 스케줄: 선형 warmup → cosine decay
@@ -580,7 +584,8 @@ def get_class_weights(dataset_name: str, num_classes: int) -> torch.Tensor:
         return freq.median() / freq
     return torch.ones(num_classes)
 
-class_weights = get_class_weights(args.dataset, num_classes).to(device)
+class_weights = (torch.ones(num_classes) if args.no_class_weights
+                 else get_class_weights(args.dataset, num_classes)).to(device)
 criterion_ce = nn.CrossEntropyLoss(
     weight=class_weights,
     ignore_index=255,
