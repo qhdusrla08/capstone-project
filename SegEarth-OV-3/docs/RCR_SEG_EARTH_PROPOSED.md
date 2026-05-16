@@ -59,22 +59,24 @@ Main stages:
 - `_cleanup_components`: absorbs small unstable components into dominant neighbors.
 - `_limit_total_changes`: prevents excessive changes from the baseline.
 
+### `rcr/evidence_extractor.py`
+
+Extracts the SegEarth-OV3 evidence that RCR needs from the frozen base model.
+
+RCR needs more than the final predicted mask. This file provides:
+
+- class-level raw logits
+- semantic logits
+- instance logits
+- semantic and instance head agreement
+- presence values
+- TTA image transforms and inverse logit transforms
+
+Keeping this extractor inside `rcr/` makes the RCR module self-contained. Other SegEarth-OV3 variants can copy the `rcr/` directory plus the small `segearthov3_segmentor.py` integration changes without bringing in unrelated experiment folders.
+
 ### `rcr/__init__.py`
 
-Exports the RCR inferencer and config loader.
-
-### `tfcc/`
-
-Provides shared class-detail extraction utilities used by RCR.
-
-RCR needs class-level raw logits, semantic logits, instance logits, head agreement, and presence values. These are produced by `tfcc/tfcc_inferencer.py` without model training or weight updates.
-
-Key files:
-
-- `tfcc/tfcc_inferencer.py`: extracts class-wise SegEarth-OV3 evidence.
-- `tfcc/transforms.py`: applies and inverses TTA views.
-- `tfcc/mask_utils.py`: small mask utility functions.
-- `tfcc/config.py`: config structure used by the shared inferencer.
+Exports the RCR inferencer, evidence extractor, and config loader.
 
 ### RCR MMSeg Configs
 

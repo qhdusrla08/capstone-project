@@ -11,10 +11,8 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from tfcc.tfcc_inferencer import TFCCInferencer
-from tfcc.transforms import inverse_transform_logits, transform_image
-
 from .config import RCRConfig, load_rcr_config
+from .evidence_extractor import RCREvidenceExtractor, inverse_transform_logits, transform_image
 
 
 class RCRInferencer:
@@ -33,7 +31,11 @@ class RCRInferencer:
         self.config = load_rcr_config(config) if not isinstance(config, RCRConfig) else config
         self.output_dir = Path(output_dir) if output_dir else None
         self.device = torch.device(device) if device is not None else getattr(base_model, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-        self.detail_inferencer = TFCCInferencer(base_model=base_model, class_names=self.class_names, config=None, output_dir=None, device=self.device)
+        self.evidence_extractor = RCREvidenceExtractor(
+            base_model=base_model,
+            class_names=self.class_names,
+            device=self.device,
+        )
         for parameter in self.base_model.parameters():
             parameter.requires_grad_(False)
 
@@ -52,7 +54,7 @@ class RCRInferencer:
             output_path.mkdir(parents=True, exist_ok=True)
         save_json = self.config.output.save_json if save_json is None else bool(save_json)
 
-        raw = self.detail_inferencer._predict_class_details(pil_image)
+        raw = self.evidence_extractor.predict_class_details(pil_image)
         raw_logits = raw["class_logits"].detach()
         raw_seg = self._logits_to_segmentation(raw_logits)
         consensus_logits, consensus_debug = self._compute_consensus_logits(pil_image, raw_logits)
@@ -98,7 +100,7 @@ class RCRInferencer:
             if view == "orig":
                 continue
             transformed = transform_image(image, view)
-            details = self.detail_inferencer._predict_class_details(transformed)
+            details = self.evidence_extractor.predict_class_details(transformed)
             restored = inverse_transform_logits(details["class_logits"], view)
             if restored.shape[-2:] != raw_logits.shape[-2:]:
                 restored = F.interpolate(restored.unsqueeze(0), size=raw_logits.shape[-2:], mode="bilinear", align_corners=False).squeeze(0)
