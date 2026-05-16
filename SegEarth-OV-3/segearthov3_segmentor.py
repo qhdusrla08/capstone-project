@@ -23,6 +23,10 @@ class SegEarthOV3Segmentation(BaseSegmentor):
                  use_sem_seg=True,
                  use_presence_score=True,
                  use_transformer_decoder=True,
+                 use_rcr=False,
+                 rcr_config_path="configs/rcr_default.yaml",
+                 rcr_output_dir="",
+                 rcr_save_json=False,
                  **kwargs):
         super().__init__()
         
@@ -47,6 +51,12 @@ class SegEarthOV3Segmentation(BaseSegmentor):
         self.use_sem_seg = use_sem_seg
         self.use_presence_score = use_presence_score
         self.use_transformer_decoder = use_transformer_decoder
+        self.classname_path = classname_path
+        self.use_rcr = use_rcr
+        self.rcr_config_path = rcr_config_path
+        self.rcr_output_dir = rcr_output_dir
+        self.rcr_save_json = rcr_save_json
+        self._rcr_inferencer = None
 
     def _inference_single_view(self, image):
         """Inference on a single PIL image or crop patch."""
@@ -161,7 +171,29 @@ class SegEarthOV3Segmentation(BaseSegmentor):
             ori_shape = meta['ori_shape']
 
             # Determine inference mode
-            if self.slide_crop > 0 and (self.slide_crop < image.size[0] or self.slide_crop < image.size[1]):
+            if self.use_rcr:
+                rcr_result = self._get_rcr_inferencer().infer_image(
+                    image_path,
+                    output_dir=self.rcr_output_dir or None,
+                    save_json=self.rcr_save_json,
+                )
+                rcr_logits = rcr_result.get("logits")
+                if torch.is_tensor(rcr_logits):
+                    seg_logits = rcr_logits.to(device=self.device, dtype=torch.float32)
+                else:
+                    seg_pred_np = rcr_result["segmentation_map"]
+                    seg_pred = torch.as_tensor(seg_pred_np, device=self.device, dtype=torch.long)
+                    if tuple(seg_pred.shape[-2:]) != tuple(ori_shape):
+                        seg_pred = F.interpolate(
+                            seg_pred.float().view(1, 1, *seg_pred.shape[-2:]),
+                            size=ori_shape,
+                            mode="nearest",
+                        ).squeeze(0).squeeze(0).long()
+                    seg_logits = F.one_hot(
+                        seg_pred.clamp_min(0),
+                        num_classes=self.num_cls,
+                    ).permute(2, 0, 1).float()
+            elif self.slide_crop > 0 and (self.slide_crop < image.size[0] or self.slide_crop < image.size[1]):
                 seg_logits = self.slide_inference(image, self.slide_stride, self.slide_crop)
             else:
                 seg_logits = self._inference_single_view(image)
@@ -216,6 +248,19 @@ class SegEarthOV3Segmentation(BaseSegmentor):
         """
         """
 
+    def _get_rcr_inferencer(self):
+        if self._rcr_inferencer is None:
+            from rcr.rcr_inferencer import RCRInferencer
+
+            self._rcr_inferencer = RCRInferencer(
+                base_model=self,
+                class_names=_read_class_rows(self.classname_path),
+                config=self.rcr_config_path,
+                output_dir=self.rcr_output_dir or None,
+                device=self.device,
+            )
+        return self._rcr_inferencer
+
 
 def get_cls_idx(path):
     with open(path, 'r') as f:
@@ -230,3 +275,8 @@ def get_cls_idx(path):
         class_indices += [idx for _ in range(len(names_i))]
     class_names = [item.replace('\n', '') for item in class_names]
     return class_names, class_indices
+
+
+def _read_class_rows(path):
+    with open(path, "r") as handle:
+        return [line.strip() for line in handle if line.strip()]

@@ -1,6 +1,8 @@
 import os
 import os.path as osp
 import argparse
+import csv
+import json
 import openpyxl
 from mmengine.runner import Runner
 from mmengine.config import Config, DictAction
@@ -76,6 +78,82 @@ def append_experiment_result(file_path, experiment_data):
     workbook.save(file_path)
 
 
+def save_classwise_results(runner, output_dir):
+    if not hasattr(runner, 'test_evaluator'):
+        return None
+
+    metrics = getattr(runner.test_evaluator, 'metrics', None)
+    if not metrics:
+        return None
+
+    metric = metrics[0]
+    if not hasattr(metric, 'results') or not metric.results:
+        return None
+
+    if not hasattr(metric, 'total_area_to_metrics'):
+        return None
+
+    results = tuple(zip(*metric.results))
+    if len(results) != 4:
+        return None
+
+    total_area_intersect = sum(results[0])
+    total_area_union = sum(results[1])
+    total_area_pred_label = sum(results[2])
+    total_area_label = sum(results[3])
+
+    ret_metrics = metric.total_area_to_metrics(
+        total_area_intersect,
+        total_area_union,
+        total_area_pred_label,
+        total_area_label,
+        metric.metrics,
+        getattr(metric, 'nan_to_num', 0),
+        getattr(metric, 'beta', 1.0),
+    )
+
+    class_names = metric.dataset_meta['classes']
+    a_acc = ret_metrics.pop('aAcc', None)
+    class_iou = [round(float(value) * 100, 2) for value in ret_metrics['IoU']]
+    class_acc = [round(float(value) * 100, 2) for value in ret_metrics['Acc']]
+    rows = [
+        {'Class': class_name, 'IoU': iou_value, 'Acc': acc_value}
+        for class_name, iou_value, acc_value in zip(class_names, class_iou, class_acc)
+    ]
+
+    os.makedirs(output_dir, exist_ok=True)
+    csv_path = os.path.join(output_dir, 'class_iou_results.csv')
+    json_path = os.path.join(output_dir, 'class_iou_results.json')
+    txt_path = os.path.join(output_dir, 'class_iou_results.txt')
+
+    with open(csv_path, 'w', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=['Class', 'IoU', 'Acc'])
+        writer.writeheader()
+        writer.writerows(rows)
+
+    summary = {
+        'aAcc': round(float(a_acc) * 100, 2) if a_acc is not None else None,
+        'mIoU': round(float(ret_metrics['IoU'].mean()) * 100, 2),
+        'mAcc': round(float(ret_metrics['Acc'].mean()) * 100, 2),
+        'classes': rows,
+    }
+    with open(json_path, 'w') as handle:
+        json.dump(summary, handle, ensure_ascii=False, indent=2)
+
+    with open(txt_path, 'w') as handle:
+        handle.write('Class\tIoU\tAcc\n')
+        for row in rows:
+            handle.write(f"{row['Class']}\t{row['IoU']}\t{row['Acc']}\n")
+        handle.write(f"\nmIoU\t{summary['mIoU']}\n")
+        handle.write(f"mAcc\t{summary['mAcc']}\n")
+
+    return {
+        'csv_path': csv_path,
+        'json_path': json_path,
+        'txt_path': txt_path,
+    }
+
+
 def trigger_visualization_hook(cfg, args):
     default_hooks = cfg.default_hooks
     if 'visualization' in default_hooks:
@@ -126,6 +204,13 @@ def main():
             f.write(os.path.basename(args.config).split('.')[0] + '\n')
             for k, v in results.items():
                 f.write(k + ': ' + str(v) + '\n')
+
+        classwise_paths = save_classwise_results(runner, args.out or cfg.work_dir)
+        if classwise_paths is not None:
+            with open(os.path.join(cfg.work_dir, 'results.txt'), 'a') as f:
+                f.write('Classwise results saved to:\n')
+                for key, value in classwise_paths.items():
+                    f.write(f'{key}: {value}\n')
 
 
 if __name__ == '__main__':

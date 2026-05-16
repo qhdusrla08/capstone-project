@@ -1,0 +1,55 @@
+use_rcr: true
+bg_idx: null
+prob_threshold: null
+exclude_classes: ["background", "background class"]
+
+tta:
+  enabled: true
+  views: ["hflip", "rot90"]
+  fuse_weight: 0.58
+  use_consensus_as_base: true
+
+boundary:
+  enabled: true
+  kernel_size: 3
+  max_margin: 0.08
+  min_consensus_gain: -0.02
+  label_boost: 0.12
+  high_confidence_lock: 0.66
+  lock_margin: 0.14
+  allow_background_relabel: false
+  max_changed_ratio: 0.06
+
+component:
+  enabled: true
+  min_area: 96
+  min_area_ratio: 0.000035
+  protect_confidence: 0.50
+  neighbor_kernel_size: 5
+  label_boost: 0.10
+  allow_background_relabel: true
+
+dense_head:
+  enabled: true
+  consensus_weight: 0.045
+  disagreement_weight: 0.018
+  max_margin: 0.10
+
+local_vote:
+  enabled: true
+  kernel_size: 5
+  min_vote_ratio: 0.56
+  max_margin: 0.10
+  consensus_agree_required: true
+  min_consensus_support: -0.025
+  label_boost: 0.12
+  allow_background_relabel: false
+  max_changed_ratio: 0.06
+
+safety:
+  max_total_changed_ratio: 0.07
+
+output:
+  save_json: false
+  keep_logits: true
+  save_masks: false
