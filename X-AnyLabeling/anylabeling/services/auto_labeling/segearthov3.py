@@ -21,6 +21,64 @@ from anylabeling.views.labeling.utils.opencv import qt_img_to_rgb_cv_img
 logger = logging.getLogger(__name__)
 
 
+class _PromptInjectingProcessor:
+    """Sam3Processor 를 감싸 set_text_prompt 호출 직후 큐잉된 spatial prompt
+    (box) 를 자동으로 add_geometric_prompt 로 주입한다.
+
+    그 외 모든 메서드(set_image, reset_all_prompts, _forward_grounding 등)는
+    __getattr__ 로 inner processor 에 그대로 위임된다.
+    """
+
+    def __init__(self, inner, wrapper):
+        # __setattr__ 가 inner 로 위임되지 않도록 직접 __dict__ 에 기록
+        object.__setattr__(self, "_inner", inner)
+        object.__setattr__(self, "_wrapper", wrapper)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def set_text_prompt(self, *args, **kwargs):
+        # SAM3 의 native signature: set_text_prompt(prompt: str, state: Dict)
+        # X-AnyLabeling baseline / RCR evidence_extractor 모두 keyword 호출
+        # (state=..., prompt=...) 패턴을 쓰므로 양쪽 모두 수용한다.
+        if "prompt" in kwargs:
+            prompt = kwargs.pop("prompt")
+        elif args:
+            prompt = args[0]
+            args = args[1:]
+        else:
+            raise TypeError("set_text_prompt requires 'prompt'")
+        if "state" in kwargs:
+            state = kwargs.pop("state")
+        elif args:
+            state = args[0]
+            args = args[1:]
+        else:
+            raise TypeError("set_text_prompt requires 'state'")
+        if kwargs or args:
+            raise TypeError(f"Unexpected args for set_text_prompt: {args} {kwargs}")
+
+        state = self._inner.set_text_prompt(prompt, state)
+
+        wrapper = self._wrapper
+        pending = getattr(wrapper, "_pending_spatial_prompts", None)
+        if not pending:
+            return state
+        class_id = wrapper._query_word_to_class_id(prompt)
+        if class_id is None:
+            return state
+        for entry in pending.get(class_id, []):
+            try:
+                state = self._inner.add_geometric_prompt(
+                    entry["box_xywh_norm"], entry["label"], state
+                )
+            except Exception as exc:  # spatial prompt 실패는 inference 전체를 막지 않음
+                logger.warning(
+                    f"add_geometric_prompt failed for class_id={class_id}: {exc}"
+                )
+        return state
+
+
 class SegEarthOV3(Model):
     """SegEarth-OV-3 open-vocabulary semantic segmentation for remote sensing."""
 
@@ -37,6 +95,12 @@ class SegEarthOV3(Model):
             "input_conf",
             "edit_conf",
             "toggle_preserve_existing_annotations",
+            # ── [ADDED] Exemplar / Spatial prompt UI ──────────────────────────
+            "button_exemplar_mode",
+            "edit_exemplar_class",
+            "exemplar_shape_combo",
+            "exemplar_radius_spinbox",
+            "button_exemplar_add_class",
         ]
         output_modes = {
             "polygon": QCoreApplication.translate("Model", "Polygon"),
@@ -83,6 +147,30 @@ class SegEarthOV3(Model):
         self.adapter_bottleneck = self.config.get("adapter_bottleneck", 64)
         self.adapter_path       = self.config.get("adapter_path", "")
 
+        # ── [ADDED] RCR-SegEarth 설정 파싱 ─────────────────────────────────────
+        # use_rcr=True 인 경우 baseline 추론 결과 대신 RCRInferencer 가 반환한
+        # refined segmentation 을 사용한다.
+        self.use_rcr          = bool(self.config.get("use_rcr", False))
+        self.rcr_config_path  = self.config.get("rcr_config_path", "") or ""
+        self.rcr_output_dir   = self.config.get("rcr_output_dir", "") or ""
+        self.rcr_save_json    = bool(self.config.get("rcr_save_json", False))
+        # RCREvidenceExtractor 가 getattr(base_model, "use_presence_score", True)
+        # 로 참조 → 명시적으로 노출하여 baseline 과 일관된 동작을 보장한다.
+        self.use_presence_score = bool(self.config.get("use_presence_score", True))
+        self._rcr_inferencer  = None
+        self._sam3_model      = None  # parameters() 셰임용 핸들
+
+        # ── [ADDED] Exemplar (spatial prompt + novel class) 상태 ──────────────
+        # _pending_spatial_prompts: 다음 predict_shapes 호출 1회 동안만 적용되는
+        # spatial box prompt 큐. 키는 class_id(int), 값은 entry dict 리스트.
+        # entry 스키마: {"box_xywh_norm": [cx,cy,w,h] in [0,1], "label": bool}
+        self._last_cv_image   = None
+        self._last_filename   = None
+        self._pending_spatial_prompts = {}
+        # Sam3Processor 의 set_text_prompt 호출 시 prompt 문자열 → class_id 역매핑
+        # 에 사용 (대소문자 무시, _parse_classes 마다 재구성).
+        self._query_word_lookup = {}
+
         # Validate paths
         if not os.path.isdir(segearthov3_path):
             raise FileNotFoundError(
@@ -116,11 +204,19 @@ class SegEarthOV3(Model):
             checkpoint_path=model_path,
             device=str(self.device),
         )
-        self.processor = Sam3Processor(
+        inner_processor = Sam3Processor(
             sam3_model,
             confidence_threshold=self.confidence_threshold,
             device=self.device,
         )
+        # [ADDED] Sam3Processor 를 proxy 로 감싸 set_text_prompt 직후 pending
+        # spatial box prompt 를 자동 주입한다. proxy 는 __getattr__ 로 나머지
+        # 메서드를 그대로 위임하므로 기존 호출부(baseline + RCR) 모두 수정 없이
+        # 동일 인터페이스로 동작한다.
+        self.processor = _PromptInjectingProcessor(inner_processor, self)
+        # RCRInferencer 가 base_model.parameters() 로 requires_grad_=False 설정
+        # 을 시도하므로 SAM3 모델 핸들을 보관해 두고 parameters() 셰임에 사용한다.
+        self._sam3_model = sam3_model
 
         # Parse class names (support comma-separated synonyms)
         self._parse_classes()
@@ -213,6 +309,12 @@ class SegEarthOV3(Model):
         self.query_idx_tensor = torch.tensor(
             self.query_idx, dtype=torch.int64, device=self.device
         )
+        # [ADDED] proxy 의 set_text_prompt hook 에서 사용할 역매핑.
+        # prompt 문자열(소문자) → 그 prompt 가 속한 클래스 id.
+        self._query_word_lookup = {
+            self.query_words[i].strip().lower(): self.query_idx[i]
+            for i in range(self.num_queries)
+        }
 
     # [NEW METHOD] heuristic 융합 모드에서 사용할 카테고리별 고정 α 가중치 벡터를
     # query_word 단위로 미리 계산해 GPU 텐서로 저장한다.
@@ -437,31 +539,52 @@ class SegEarthOV3(Model):
             pil_image = PILImage.fromarray(cv_image)
             h, w = cv_image.shape[:2]
 
-            # Choose inference mode
-            if self.slide_crop > 0 and (
-                self.slide_crop < w or self.slide_crop < h
-            ):
-                seg_logits = self._slide_inference(pil_image)
+            # [ADDED] 이미지 캐시 및 ephemeral spatial-prompt 큐 라이프사이클 관리.
+            # filename 이 바뀌면 직전 이미지에서 큐잉됐던 좌표가 새 이미지에
+            # 잘못 적용되는 것을 막기 위해 자동 폐기한다.
+            if filename and filename != self._last_filename:
+                if self._pending_spatial_prompts:
+                    logger.info(
+                        "cleared pending spatial prompts (filename change "
+                        f"{self._last_filename!r} -> {filename!r})"
+                    )
+                self._pending_spatial_prompts.clear()
+            self._last_cv_image = cv_image
+            self._last_filename = filename
+
+            # ── [ADDED] RCR-SegEarth 분기 ─────────────────────────────────────
+            # use_rcr=True 인 경우 baseline 추론을 우회하고 RCRInferencer 가
+            # 반환한 refined segmentation_map 을 그대로 사용한다.
+            if self.use_rcr:
+                seg_pred_np = self._run_rcr_inference(pil_image, filename)
             else:
-                seg_logits = self._inference_single_view(pil_image)
+                # Choose inference mode
+                if self.slide_crop > 0 and (
+                    self.slide_crop < w or self.slide_crop < h
+                ):
+                    seg_logits = self._slide_inference(pil_image)
+                else:
+                    seg_logits = self._inference_single_view(pil_image)
 
-            # Aggregate class synonyms if needed
-            if self.num_cls != self.num_queries:
-                seg_logits = seg_logits.unsqueeze(0)
-                cls_index = F.one_hot(
-                    self.query_idx_tensor, num_classes=self.num_cls
-                )
-                cls_index = cls_index.T.view(
-                    self.num_cls, self.num_queries, 1, 1
-                ).float()
-                seg_logits = (seg_logits * cls_index).max(1)[0]
+                # Aggregate class synonyms if needed
+                if self.num_cls != self.num_queries:
+                    seg_logits = seg_logits.unsqueeze(0)
+                    cls_index = F.one_hot(
+                        self.query_idx_tensor, num_classes=self.num_cls
+                    )
+                    cls_index = cls_index.T.view(
+                        self.num_cls, self.num_queries, 1, 1
+                    ).float()
+                    seg_logits = (seg_logits * cls_index).max(1)[0]
 
-            # Get predictions
-            seg_pred = torch.argmax(seg_logits, dim=0)
-            max_vals = seg_logits.max(0)[0]
-            seg_pred[max_vals < self.prob_thd] = self.bg_idx
+                # Get predictions
+                seg_pred = torch.argmax(seg_logits, dim=0)
+                max_vals = seg_logits.max(0)[0]
+                seg_pred[max_vals < self.prob_thd] = self.bg_idx
 
-            seg_pred_np = seg_pred.cpu().numpy()
+                seg_pred_np = seg_pred.cpu().numpy()
+                # baseline 경로도 ephemeral 큐를 소비한 것으로 간주.
+                self._pending_spatial_prompts.clear()
 
             # Convert segmentation mask to polygon shapes
             shapes = self._mask_to_shapes(seg_pred_np, h, w)
@@ -471,6 +594,237 @@ class SegEarthOV3(Model):
         except Exception as e:
             logger.error(f"SegEarth-OV-3 inference error: {e}")
             return AutoLabelingResult([], replace=False)
+
+    # ── [ADDED] RCR-SegEarth 통합 헬퍼 ────────────────────────────────────────
+    def parameters(self):
+        """RCRInferencer 가 base_model.parameters() 로 grad 동결을 시도하므로
+        SAM3 모델의 파라미터 이터레이터를 위임 노출한다.
+        """
+        if self._sam3_model is None:
+            return iter([])
+        return self._sam3_model.parameters()
+
+    def _get_rcr_inferencer(self):
+        """RCRInferencer 를 lazy 초기화한다. segearthov3_path 가 이미
+        sys.path 에 추가돼 있으므로 rcr 패키지를 바로 import 할 수 있다."""
+        if self._rcr_inferencer is not None:
+            return self._rcr_inferencer
+        from rcr.rcr_inferencer import RCRInferencer
+
+        rcr_config = self.rcr_config_path if self.rcr_config_path else None
+        if rcr_config and not os.path.isfile(rcr_config):
+            logger.warning(
+                f"RCR config not found at {rcr_config}, falling back to defaults."
+            )
+            rcr_config = None
+
+        self._rcr_inferencer = RCRInferencer(
+            base_model=self,
+            class_names=list(self.classes),
+            config=rcr_config,
+            output_dir=(self.rcr_output_dir or None),
+            device=self.device,
+        )
+        return self._rcr_inferencer
+
+    def _run_rcr_inference(self, pil_image, filename):
+        """RCRInferencer.infer_image 를 호출하고 (H, W) 정수 클래스 맵을 반환한다.
+
+        spatial prompt 큐가 비어있지 않으면 RCR 의 TTA(consensus) 단계만 일시
+        비활성한다. boundary / local_vote / component / safety 등 나머지 RCR
+        단계는 그대로 적용. inference 직후 ephemeral 큐를 비운다.
+        """
+        inferencer = self._get_rcr_inferencer()
+        has_spatial = bool(self._pending_spatial_prompts)
+        prev_tta_enabled = inferencer.config.tta.enabled
+        if has_spatial:
+            inferencer.config.tta.enabled = False
+            logger.info(
+                f"RCR TTA disabled (spatial active for class_ids="
+                f"{sorted(self._pending_spatial_prompts.keys())})"
+            )
+
+        image_id = None
+        if filename:
+            image_id = os.path.splitext(os.path.basename(str(filename)))[0]
+        try:
+            result = inferencer.infer_image(
+                pil_image,
+                image_id=image_id,
+                output_dir=(self.rcr_output_dir or None),
+                save_json=self.rcr_save_json,
+            )
+        finally:
+            inferencer.config.tta.enabled = prev_tta_enabled
+            # ephemeral: 1회 소비. 동일 이미지 재실행 시 새 spatial 입력 필요.
+            self._pending_spatial_prompts.clear()
+
+        seg_map = result.get("segmentation_map")
+        if seg_map is None:
+            # 폴백: logits 가 있다면 argmax + prob_thd 로 mask 생성
+            logits = result.get("logits")
+            if torch.is_tensor(logits):
+                seg_pred = torch.argmax(logits, dim=0)
+                max_vals = logits.max(0)[0]
+                seg_pred[max_vals < self.prob_thd] = self.bg_idx
+                return seg_pred.detach().cpu().numpy().astype(np.int32)
+            raise RuntimeError("RCRInferencer returned no segmentation output.")
+        return np.asarray(seg_map, dtype=np.int32)
+
+    # ── [ADDED] Exemplar / Spatial prompt 통합 헬퍼 ──────────────────────────
+    def _query_word_to_class_id(self, prompt):
+        """proxy processor 가 set_text_prompt 호출 시 호출하는 역매핑.
+        대소문자 무시. 매칭 실패 시 None.
+        """
+        if not isinstance(prompt, str):
+            return None
+        return self._query_word_lookup.get(prompt.strip().lower())
+
+    def _resolve_or_register_class_id(self, label):
+        """라벨 문자열을 기존 self.classes 와 매칭. 미존재 시 새 클래스로 등록.
+
+        매칭은 case-insensitive, 클래스 엔트리의 동의어(comma-separated)도 검사.
+        새 클래스가 등록되면 _parse_classes / _build_alpha_vector 재호출 +
+        기 lazy-init 된 RCR inferencer 무효화 (class_names 캐시 갱신 위해).
+        """
+        if not isinstance(label, str):
+            return None
+        canon = label.strip()
+        if not canon:
+            return None
+        canon_lower = canon.lower()
+        for idx, cls_entry in enumerate(self.classes):
+            for synonym in cls_entry.split(","):
+                if synonym.strip().lower() == canon_lower:
+                    return idx
+        # 미존재 → 등록
+        self.classes.append(canon)
+        new_id = len(self.classes) - 1
+        self._parse_classes()
+        self._build_alpha_vector()
+        # RCR inferencer 는 __init__ 에서 class_names 를 캐시하므로 무효화.
+        # 다음 _get_rcr_inferencer 호출 시 새 class_names 로 재생성된다.
+        self._rcr_inferencer = None
+        logger.info(
+            f"registered new class '{canon}' as id={new_id} "
+            f"(num_cls={self.num_cls})"
+        )
+        return new_id
+
+    @staticmethod
+    def _clamp_xyxy(x1, y1, x2, y2, h, w):
+        """이미지 경계 안으로 clamp + min/max 정렬."""
+        x_min, x_max = sorted((float(x1), float(x2)))
+        y_min, y_max = sorted((float(y1), float(y2)))
+        x_min = max(0.0, min(x_min, float(w - 1)))
+        x_max = max(0.0, min(x_max, float(w - 1)))
+        y_min = max(0.0, min(y_min, float(h - 1)))
+        y_max = max(0.0, min(y_max, float(h - 1)))
+        return x_min, y_min, x_max, y_max
+
+    def _xyxy_to_cxcywh_norm(self, x1, y1, x2, y2, h, w):
+        """SAM3 add_geometric_prompt 가 요구하는 [cx,cy,w,h] in [0,1] 로 변환."""
+        x_min, y_min, x_max, y_max = self._clamp_xyxy(x1, y1, x2, y2, h, w)
+        bw = max(1.0, x_max - x_min)
+        bh = max(1.0, y_max - y_min)
+        cx = (x_min + x_max) * 0.5
+        cy = (y_min + y_max) * 0.5
+        return [cx / w, cy / h, bw / w, bh / h]
+
+    def _point_to_cxcywh_norm(self, x, y, radius, h, w):
+        """point + radius 를 동일 box 포맷으로 변환 (SAM3 public API 가 box 만)."""
+        x = max(0.0, min(float(x), float(w - 1)))
+        y = max(0.0, min(float(y), float(h - 1)))
+        r = max(1.0, float(radius))
+        bw = min(2.0 * r, float(w))
+        bh = min(2.0 * r, float(h))
+        return [x / w, y / h, bw / w, bh / h]
+
+    def set_auto_labeling_marks(self, marks):
+        """X-AnyLabeling auto_labeling widget 으로부터 exemplar 마크를 받아
+        spatial prompt 큐 갱신 및 novel class 등록을 수행한다.
+
+        marks 스키마(예시):
+          {"type":"exemplar", "shape_type":"rectangle", "data":[x1,y1,x2,y2],
+           "label":"<class name>"}
+          {"type":"exemplar", "shape_type":"point", "data":[x,y],
+           "radius": <px>, "label":"<class name>"}
+          {"type":"exemplar", "shape_type":"text_only", "data":None,
+           "label":"<class name>"}
+        그 외 type 은 무시 (SAM 스타일 marks 등은 본 모델에 의미 없음).
+        """
+        if not isinstance(marks, list) or len(marks) == 0:
+            return
+        # text-only 마크는 이미지 캐시 없이도 가능하므로 spatial 마크 유무를
+        # 먼저 확인한다.
+        spatial_marks_present = any(
+            isinstance(m, dict)
+            and m.get("type") == "exemplar"
+            and m.get("shape_type") in ("rectangle", "point")
+            for m in marks
+        )
+        if spatial_marks_present and self._last_cv_image is None:
+            logger.warning(
+                "set_auto_labeling_marks: no cached image yet. "
+                "Run inference once before injecting spatial exemplars."
+            )
+            return
+        h, w = (
+            self._last_cv_image.shape[:2]
+            if self._last_cv_image is not None
+            else (1, 1)
+        )
+        added = 0
+        for mark in marks:
+            if not isinstance(mark, dict) or mark.get("type") != "exemplar":
+                continue
+            label = mark.get("label", "")
+            class_id = self._resolve_or_register_class_id(label)
+            if class_id is None:
+                logger.warning(
+                    f"set_auto_labeling_marks: skipped mark with invalid label "
+                    f"{label!r}"
+                )
+                continue
+            shape_type = mark.get("shape_type", "")
+            data = mark.get("data")
+            if shape_type == "text_only":
+                # 등록만 수행 (spatial 큐에 push 하지 않음)
+                continue
+            try:
+                if shape_type == "rectangle":
+                    if not (isinstance(data, (list, tuple)) and len(data) == 4):
+                        raise ValueError(f"rectangle data shape: {data!r}")
+                    box = self._xyxy_to_cxcywh_norm(
+                        data[0], data[1], data[2], data[3], h, w
+                    )
+                elif shape_type == "point":
+                    if not (isinstance(data, (list, tuple)) and len(data) == 2):
+                        raise ValueError(f"point data shape: {data!r}")
+                    radius = mark.get("radius", 12)
+                    box = self._point_to_cxcywh_norm(
+                        data[0], data[1], radius, h, w
+                    )
+                else:
+                    logger.warning(
+                        f"set_auto_labeling_marks: unsupported shape_type "
+                        f"{shape_type!r}; skipped"
+                    )
+                    continue
+            except Exception as exc:
+                logger.warning(
+                    f"set_auto_labeling_marks: malformed mark {mark!r} ({exc})"
+                )
+                continue
+            entry = {"box_xywh_norm": box, "label": True}
+            self._pending_spatial_prompts.setdefault(class_id, []).append(entry)
+            added += 1
+        if added:
+            logger.info(
+                f"set_auto_labeling_marks: queued {added} spatial prompt(s); "
+                f"pending={{cid: count}} = "
+                f"{ {k: len(v) for k, v in self._pending_spatial_prompts.items()} }"
+            )
 
     def _mask_to_shapes(self, seg_pred, h, w):
         """Convert segmentation mask to Shape objects."""
@@ -550,10 +904,18 @@ class SegEarthOV3(Model):
                 hook.remove()
             self._hooks.clear()
 
+        if hasattr(self, "_rcr_inferencer"):
+            self._rcr_inferencer = None
         if hasattr(self, "processor"):
             del self.processor
         if hasattr(self, "_adapters"):
             del self._adapters
         if hasattr(self, "_fpn"):
             del self._fpn
+        self._sam3_model = None
+        # [ADDED] exemplar 상태 정리
+        self._pending_spatial_prompts = {}
+        self._last_cv_image = None
+        self._last_filename = None
+        self._query_word_lookup = {}
         torch.cuda.empty_cache()

@@ -109,6 +109,7 @@ _AUTO_LABELING_MARKS_MODELS = [
     "florence2",
     "geco",
     "yoloe",
+    "segearthov3",
 ]
 
 
@@ -155,6 +156,7 @@ _SKIP_DET_MODELS = [
 # --- skip_prediction_on_new_marks ---
 _SKIP_PREDICTION_ON_NEW_MARKS_MODELS = [
     "yoloe",
+    "segearthov3",
 ]
 
 

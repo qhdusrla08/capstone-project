@@ -2,47 +2,85 @@ type: segearthov3
 name: segearthov3-sam3
 display_name: "SegEarth-OV-3 (SAM3)"
 model_path: /home/yeon030108/capstone/SegEarth-OV-3/weights/sam3/sam3.pt
-segearthov3_path: /home/yeon030108/capstone/SegEarth-OV-3
+segearthov3_path: /home/yeon030108/capstone-project-rcr-segearth/SegEarth-OV-3
 classes:
-  - background
-  - "bareland,barren"
-  - grass
-  - road
-  - "tree,forest"
-  - "water,river"
-  - cropland
-  - "building,roof,house"
-# - "car, vehicle, truck"
-  - parking lot
+ - road
+ - building
+ - grass
+ - tree
+ - car
+ - clutter
 
+# LoveDA
+# - background
+# - "building,house"
+# - road
+# - water
+# - "barren,bareland,soil"
+# - "forest,tree"
+# - agricultural
+
+# OEM
+# - background
+#- "bareland,barren"
+# - grass
+# - "pavement,sidewalk"
+# - road
+# - "tree,forest"
+# - "water,river"
+# - cropland
+# - "building,roof,house"
+
+
+# - parking lot
+# - rail
+
+
+# Vaihingen
 prob_thd: 0.1
-confidence_threshold: 0.1
-slide_stride: 512
-slide_crop: 512
-bg_idx: 0
+confidence_threshold: 0.4
+slide_stride: 0       # eval 과 동일하게 단일 추론
+slide_crop: 0
+bg_idx: 5
 epsilon_factor: 0.001
 
-# --- Category-Adaptive Dual-Head Fusion 설정 ---
-fusion_mode: "heuristic"   # "max" | "heuristic" | "entropy"
-things_alpha: 0.8          # things 카테고리: instance head 가중치
-stuff_alpha: 0.2           # stuff 카테고리: semantic head 가중치
-things_categories:
-  - building
- # - car
- # - car
- # - ship
- # - airplane
- # - vehicle
+# OEM
+# prob_thd: 0.1
+# confidence_threshold: 0.1
+# slide_stride: 512
+# slide_crop: 512
+# bg_idx: 0
+# epsilon_factor: 0.001
 
-# --- Multi-scale Adapter (Novelty 1) 설정 ---
-# adapter_mode:       "off"  → 어댑터 비활성화 (기본값, 기존 동작 유지)
-#                     "hook" → Forward Hook 기반 추론 전용 모드 (가중치 무작위 초기화, scale=0)
-#                     "full" → 학습된 어댑터 가중치 로드 모드
-adapter_mode: "off"
+# ─────────────────────────────────────────────────────────────────────────────
+# 아래 두 섹션(Category-Adaptive Dual-Head Fusion / Multi-scale Adapter)은
+# use_rcr=true 일 때 RCR 내부 evidence extractor 가 자체 fusion 을 수행하므로
+# 실제로 호출되지 않는다. RCR 단독 실행을 위해 모두 비활성 기본값으로 고정한다.
+# ─────────────────────────────────────────────────────────────────────────────
 
-# adapter_bottleneck: RSAdapter 병목 차원 (기본 64 → 학습 파라미터 ~4.2M)
+# --- Category-Adaptive Dual-Head Fusion 설정 (INACTIVE under use_rcr=true) ---
+fusion_mode: "max"          # baseline max fusion; heuristic/entropy 사용 시 use_rcr=false 로 변경
+things_alpha: 0.8
+stuff_alpha: 0.2
+things_categories: []       # things 카테고리 지정 비활성화
+
+# --- Multi-scale Adapter (Novelty 1) 설정 (INACTIVE under use_rcr=true) ---
+adapter_mode: "off"         # RSAdapter / FPN hook 모두 비활성화
 adapter_bottleneck: 64
-
-# adapter_path: 학습된 어댑터+FPN 가중치 파일 경로 (full 모드에서만 사용)
-# adapter_path: /home/yeon030108/capstone/SegEarth-OV-3/rs_adapter/adapter_ckpt.pt
 adapter_path: ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# --- RCR-SegEarth (Region-Consistency Refinement) 설정 ---
+# use_rcr=true 일 때만 RCRInferencer 경로가 사용된다.
+# ─────────────────────────────────────────────────────────────────────────────
+use_rcr: true
+
+# rcr_config_path: RCR YAML 설정 파일 (절대 경로 권장)
+#                  비워두면 RCR 기본 설정(rcr/config.py 의 dataclass 디폴트) 사용
+rcr_config_path: /home/yeon030108/capstone-project-rcr-segearth/SegEarth-OV-3/configs/rcr_vaihingen.yaml
+
+# rcr_output_dir: RCR 디버그 아티팩트 저장 경로 (비우면 저장 안 함)
+rcr_output_dir: ""
+
+# rcr_save_json: per-image RCR 디버그 JSON 저장 여부
+rcr_save_json: false

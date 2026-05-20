@@ -486,6 +486,63 @@
        </property>
       </widget>
      </item>
+     <!-- ── [ADDED] SegEarth-OV-3 / SAM3 Exemplar prompt UI ─────────────── -->
+     <item>
+      <widget class="QPushButton" name="button_exemplar_mode">
+       <property name="checkable">
+        <bool>true</bool>
+       </property>
+       <property name="text">
+        <string>Exemplar (Off)</string>
+       </property>
+       <property name="toolTip">
+        <string>Toggle exemplar-input mode for SAM3 spatial prompts (box/point) on the canvas.</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLineEdit" name="edit_exemplar_class">
+       <property name="placeholderText">
+        <string>Class name (e.g. building)</string>
+       </property>
+       <property name="toolTip">
+        <string>Target class label for the next spatial prompt or text-only registration.</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QComboBox" name="exemplar_shape_combo">
+       <property name="toolTip">
+        <string>Spatial prompt shape: Rect (drag) or Point (click).</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QSpinBox" name="exemplar_radius_spinbox">
+       <property name="minimum">
+        <number>5</number>
+       </property>
+       <property name="maximum">
+        <number>50</number>
+       </property>
+       <property name="value">
+        <number>12</number>
+       </property>
+       <property name="toolTip">
+        <string>Point radius (px); point prompt is converted to a 2*r square box.</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="button_exemplar_add_class">
+       <property name="text">
+        <string>Add Class</string>
+       </property>
+       <property name="toolTip">
+        <string>Register the class name as a new text-only concept (no spatial prompt).</string>
+       </property>
+      </widget>
+     </item>
     </layout>
    </item>
    <item>

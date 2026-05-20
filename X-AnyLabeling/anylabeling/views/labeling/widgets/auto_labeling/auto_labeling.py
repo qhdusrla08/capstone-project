@@ -329,6 +329,30 @@ class AutoLabelingWidget(QWidget):
         )
         self.on_mask_fineness_changed(self.mask_fineness_slider.value())
 
+        # --- Configuration for: Exemplar (SegEarth-OV-3 / SAM3 spatial prompt) ---
+        # 위젯이 모든 모델에서 자동으로 숨겨지는 것은 hide_labeling_widgets() 가
+        # 처리한다. wrapper 의 Meta.widgets 에 이름을 등록한 모델에서만 노출됨.
+        self.exemplar_mode = False
+        self.button_exemplar_mode.setStyleSheet(get_normal_button_style())
+        self.button_exemplar_mode.clicked.connect(
+            self.on_exemplar_mode_toggled
+        )
+        self.edit_exemplar_class.setStyleSheet(get_lineedit_style())
+        # 콤보 항목: ("표시 텍스트", AutoLabelingMode shape_type)
+        self.exemplar_shape_combo.clear()
+        self.exemplar_shape_combo.addItem(
+            "Rect", AutoLabelingMode.RECTANGLE
+        )
+        self.exemplar_shape_combo.addItem(
+            "Point", AutoLabelingMode.POINT
+        )
+        self.button_exemplar_add_class.setStyleSheet(
+            get_normal_button_style()
+        )
+        self.button_exemplar_add_class.clicked.connect(
+            self.on_exemplar_add_class_clicked
+        )
+
         # ===================================
         #  End of Auto labeling buttons
         # ===================================
@@ -906,18 +930,137 @@ class AutoLabelingWidget(QWidget):
             "button_skip_detection",
             "mask_fineness_slider",
             "mask_fineness_value_label",
+            # [ADDED] SegEarth-OV-3 / SAM3 Exemplar prompt UI
+            "button_exemplar_mode",
+            "edit_exemplar_class",
+            "exemplar_shape_combo",
+            "exemplar_radius_spinbox",
+            "button_exemplar_add_class",
         ]
         for widget in widgets:
             getattr(self, widget).hide()
 
     def on_new_marks(self, marks):
         """Handle new marks"""
+        # [ADDED] Exemplar 모드일 때는 SAM 스타일 일반 추론 대신 wrapper 의
+        # exemplar 스키마로 변환해 보내고, 다음 mark 의도치 않은 연속 주입을
+        # 막기 위해 토글을 자동 OFF 처리한다.
+        if self.exemplar_mode:
+            exemplar_marks = self._convert_marks_to_exemplar(marks)
+            if exemplar_marks:
+                self.model_manager.set_auto_labeling_marks(exemplar_marks)
+                self._set_exemplar_mode(False)
+            return
+
         self.model_manager.set_auto_labeling_marks(marks)
         if self.skip_auto_prediction:
             return
         current_model_name = self.model_manager.loaded_model_config["type"]
         if current_model_name not in _SKIP_PREDICTION_ON_NEW_MARKS_MODELS:
             self.run_prediction()
+
+    # ── [ADDED] Exemplar prompt helpers ────────────────────────────────────
+    def on_exemplar_mode_toggled(self, checked):
+        """Exemplar 토글 버튼 클릭 → 모드 ON/OFF."""
+        self._set_exemplar_mode(bool(checked))
+
+    def _set_exemplar_mode(self, on):
+        """Exemplar 모드 진입/탈출.
+
+        ON 시 콤보의 현재 선택값(Rect/Point)으로 Canvas drawing 모드 진입.
+        OFF 시 Canvas 입력 모드 해제. 버튼 텍스트/스타일도 함께 갱신.
+        """
+        self.exemplar_mode = bool(on)
+        if self.exemplar_mode:
+            shape_type = self.exemplar_shape_combo.currentData()
+            if shape_type not in (
+                AutoLabelingMode.RECTANGLE,
+                AutoLabelingMode.POINT,
+            ):
+                shape_type = AutoLabelingMode.RECTANGLE
+            self.set_auto_labeling_mode(AutoLabelingMode.ADD, shape_type)
+            self.button_exemplar_mode.setText(self.tr("Exemplar (On)"))
+            self.button_exemplar_mode.setStyleSheet(
+                get_highlight_button_style()
+            )
+        else:
+            self.set_auto_labeling_mode(None)
+            self.button_exemplar_mode.setText(self.tr("Exemplar (Off)"))
+            self.button_exemplar_mode.setStyleSheet(get_normal_button_style())
+        # 버튼 상태 동기화 (외부에서 _set_exemplar_mode(False) 가 호출되어도
+        # checked 상태가 일관되게 유지되도록 함).
+        if self.button_exemplar_mode.isChecked() != self.exemplar_mode:
+            self.button_exemplar_mode.blockSignals(True)
+            self.button_exemplar_mode.setChecked(self.exemplar_mode)
+            self.button_exemplar_mode.blockSignals(False)
+
+    def _convert_marks_to_exemplar(self, marks):
+        """Canvas SAM 스타일 marks → wrapper exemplar 스키마로 변환.
+
+        입력 (rectangle): {"type":"rectangle","data":[x1,y1,x2,y2],"label":1}
+        입력 (point):     {"type":"point","data":[x,y],"label":1}
+        출력:
+          {"type":"exemplar","shape_type":"rectangle"|"point",
+           "data":[...], "label":"<class>", "radius"?:<px>}
+
+        클래스명이 비어 있으면 빈 리스트 반환 (변환 skip).
+        """
+        class_name = self.edit_exemplar_class.text().strip()
+        if not class_name:
+            logger.warning(
+                "Exemplar mode: class name is empty; skipping mark conversion."
+            )
+            return []
+        radius = int(self.exemplar_radius_spinbox.value())
+        converted = []
+        for mark in marks or []:
+            mtype = mark.get("type")
+            if mtype == "rectangle":
+                data = mark.get("data")
+                if not (isinstance(data, (list, tuple)) and len(data) == 4):
+                    continue
+                converted.append(
+                    {
+                        "type": "exemplar",
+                        "shape_type": "rectangle",
+                        "data": list(data),
+                        "label": class_name,
+                    }
+                )
+            elif mtype == "point":
+                data = mark.get("data")
+                if not (isinstance(data, (list, tuple)) and len(data) == 2):
+                    continue
+                converted.append(
+                    {
+                        "type": "exemplar",
+                        "shape_type": "point",
+                        "data": list(data),
+                        "radius": radius,
+                        "label": class_name,
+                    }
+                )
+        return converted
+
+    def on_exemplar_add_class_clicked(self):
+        """텍스트-only novel class 등록.
+
+        edit_exemplar_class 의 텍스트만으로 새 클래스를 wrapper 의 self.classes
+        에 추가한다. spatial prompt 큐에는 push 하지 않음.
+        """
+        class_name = self.edit_exemplar_class.text().strip()
+        if not class_name:
+            logger.warning(
+                "Exemplar add-class: class name is empty; nothing to register."
+            )
+            return
+        mark = {
+            "type": "exemplar",
+            "shape_type": "text_only",
+            "data": None,
+            "label": class_name,
+        }
+        self.model_manager.set_auto_labeling_marks([mark])
 
     def on_open(self):
         pass

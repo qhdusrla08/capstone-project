@@ -5,7 +5,7 @@ exclude_classes: ["background", "background class"]
 
 tta:
   enabled: true
-  views: ["hflip", "rot90"]
+  views: ["rot90"]  # "hflip", 뺌 -> 추론 시간 떄문 (26.05.17.)
   fuse_weight: 0.58
   use_consensus_as_base: true
 
