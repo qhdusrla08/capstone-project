@@ -5,7 +5,7 @@
 **Training-Free Open-Vocabulary Remote Sensing Auto-Labeling**
 **with Region Consistency Refinement and User-Assisted Exemplar Prompting**
 
-_Capstone Design Project — Yeongmin Jeong, Boyeon Kim (2026)_
+_Capstone Design Project (2026)_
 
 </div>
 
@@ -26,7 +26,7 @@ Commercial labeling tools succeed on natural images but fail on **remote-sensing
 
 - 🛰 **Training-free RCR refinement** — TTA consensus + boundary / local-vote / component cleanup + safety cap, on top of frozen SegEarth-OV3 + SAM 3. No fine-tuning, no extra weights.
 - 🖱 **X-AnyLabeling integration** — SAM 3 native text / box / point prompts, on-the-fly novel-class registration, editable vector polygons as the deliverable.
-- 🥇 **4-dataset SOTA among training-free OVSS** — average **mIoU 54.5 %** across LoveDA, OpenEarthMap, Potsdam, Vaihingen.
+- 📈 **Consistent gains over the SegEarth-OV3 baseline** — lifts average **mIoU to 54.5 %** (+2.3 over baseline) on LoveDA, OpenEarthMap, Potsdam, Vaihingen.
 - 🧩 **Self-contained module** — the [`rcr/`](SegEarth-OV-3/rcr/) package drops into any SegEarth-OV3 variant without retraining; reuses base-model evidence only.
 
 ---
